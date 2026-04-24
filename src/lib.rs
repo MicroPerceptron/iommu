@@ -5,6 +5,7 @@ extern crate std;
 
 mod addr;
 mod arch;
+mod devs;
 mod error;
 mod firm;
 
