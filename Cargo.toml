@@ -2,6 +2,8 @@
 name = "iommu"
 version = "0.2.0"
 edition = "2024"
+license = "MIT"
+repository = "https://github.com/MicroPerceptron/iommu"
 
 [dependencies]
 memory_addr = { version = "0.4.1", default-features = false }

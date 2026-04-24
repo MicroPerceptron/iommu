@@ -4,6 +4,7 @@
 extern crate std;
 
 mod addr;
+mod arch;
 mod error;
 
 pub use addr::{
