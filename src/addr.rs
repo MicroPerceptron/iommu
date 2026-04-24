@@ -203,6 +203,12 @@ impl<T: Unsigned> MmioAddrRangeExt<T> for MmioAddrRange<T> {
 /// ISA level). Widening to `usize` would silently admit invalid ports.
 #[derive(Copy, Clone, Ord, PartialOrd, Eq, PartialEq, Hash)]
 #[repr(transparent)]
+#[cfg_attr(
+    not(target_arch = "x86_64"),
+    deprecated(
+        note = "Io ports are only meaningful on x86_64 targets, but they're being used on a different architecture"
+    )
+)]
 pub struct IoPort(u16);
 
 impl From<u16> for IoPort {
@@ -278,6 +284,12 @@ impl fmt::UpperHex for IoPort {
 /// Range of port I/O addresses. `end` is exclusive, matching the
 /// convention used by [`AddrRange`] for MMIO / IOVA.
 #[derive(Copy, Clone, Eq, PartialEq, Hash)]
+#[cfg_attr(
+    not(target_arch = "x86_64"),
+    deprecated(
+        note = "Io ports are only meaningful on x86_64 targets, but they're being used on a different architecture"
+    )
+)]
 pub struct IoPortRange {
     start: IoPort,
     end: IoPort,
