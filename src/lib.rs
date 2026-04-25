@@ -1,10 +1,7 @@
-#![no_std]
-
-#[cfg(test)]
-extern crate std;
+#![cfg_attr(not(test), no_std)]
 
 mod addr;
-mod arch;
+pub mod arch;
 mod devs;
 mod error;
 mod firm;
@@ -12,4 +9,10 @@ mod firm;
 pub use addr::{
     IoPort, IoPortRange, Iovi32Addr, Iovi32AddrRange, IoviAddr, IoviAddrRange, Mmio32Addr,
     Mmio32AddrRange, MmioAddr, MmioAddrRange, Unsigned,
+};
+pub use kpte::{
+    AccessFlags, CachePolicy, Coherency, FrameAllocator, IntoMapBacking, MapBacking, Mapping,
+    MappingContiguity, MappingFlags, MemoryAttributes, NoFlush, PageSize, PageTable,
+    PageTableEntry, PageTableEntryKind, PagingError, PagingMetaData, PagingResult, Shareability,
+    TlbInvalidation,
 };

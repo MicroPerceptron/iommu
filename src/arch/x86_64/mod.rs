@@ -1,2 +1,2 @@
-mod amd;
-mod intel;
+pub mod amd;
+pub mod intel;

@@ -1,2 +1,2 @@
-mod rimt;
-mod riscv;
+pub mod rimt;
+pub mod riscv;

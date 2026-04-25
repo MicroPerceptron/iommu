@@ -1,0 +1,12 @@
+{
+  "rust-analyzer.cargo.target": "x86_64-unknown-none",
+  "rust-analyzer.check.overrideCommand": [
+    "cargo",
+    "check",
+    "-p",
+    "iommu",
+    "--target",
+    "x86_64-unknown-none",
+    "--message-format=json"
+  ]
+}

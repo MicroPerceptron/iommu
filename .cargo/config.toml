@@ -1,0 +1,14 @@
+[alias]
+# ── workspace ────────────────────────────────────────────────────────
+check-all = "check --workspace --all-targets"
+test-all = "test --workspace"
+check-host = "check --workspace"
+test-host = "test --workspace"
+
+# ── cross-target checks (src/platform arch paths) ───────────────────
+check-x86 = "check -p iommu --target x86_64-unknown-none"
+check-aarch64 = "check -p iommu --target aarch64-unknown-none"
+check-riscv = "check -p iommu --target riscv64gc-unknown-none-elf"
+
+[net]
+git-fetch-with-cli = true

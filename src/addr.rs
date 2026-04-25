@@ -1,4 +1,4 @@
-use core::fmt;
+use core::{fmt, marker::PhantomData, mem::size_of};
 
 use memory_addr::{AddrRange, MemoryAddr, PhysAddr, PhysAddrRange};
 
@@ -6,18 +6,35 @@ use memory_addr::{AddrRange, MemoryAddr, PhysAddr, PhysAddrRange};
 /// for MMIO and IOVA addresses.
 pub trait Unsigned: Copy + Ord + Sized {
     const MAX: usize;
+
+    fn checked_add(self, offset: usize) -> Option<Self>;
 }
 
 impl Unsigned for u32 {
     const MAX: usize = u32::MAX as usize;
+
+    #[inline]
+    fn checked_add(self, offset: usize) -> Option<Self> {
+        self.checked_add(offset as u32)
+    }
 }
 
 impl Unsigned for u64 {
     const MAX: usize = u64::MAX as usize;
+
+    #[inline]
+    fn checked_add(self, offset: usize) -> Option<Self> {
+        self.checked_add(offset as u64)
+    }
 }
 
 impl Unsigned for usize {
     const MAX: usize = usize::MAX;
+
+    #[inline]
+    fn checked_add(self, offset: usize) -> Option<Self> {
+        self.checked_add(offset)
+    }
 }
 
 #[repr(C)]
@@ -26,12 +43,10 @@ union Cast<T: Copy, U: Copy> {
     to: U,
 }
 
-/// Common supertrait for MMIO and IOVA addresses, which share the same address
-/// space and access semantics. This allows us to provide shared helper methods
-/// for both types without code duplication.
+/// Convert from an unsigned integer type to usize for address manipulation.
 #[inline(always)]
 const fn into_usize<T: Unsigned>(value: T) -> usize {
-    if core::mem::size_of::<T>() == 4 {
+    if size_of::<T>() == 4 {
         // Safe for u32 -> usize (zero-extended)
         let c = Cast::<T, u32> { from: value };
         unsafe { c.to as usize }
@@ -42,13 +57,11 @@ const fn into_usize<T: Unsigned>(value: T) -> usize {
     }
 }
 
-/// Common supertrait for MMIO and IOVA addresses, which share the same address
-/// space and access semantics. This allows us to provide shared helper methods
-/// for both types without code duplication.
+/// Convert from usize to an unsigned integer type for address storage.
 #[inline(always)]
 const fn from_usize<T: Unsigned>(value: usize) -> T {
     assert!(value <= T::MAX);
-    if core::mem::size_of::<T>() == 4 {
+    if size_of::<T>() == 4 {
         // Safe for usize -> u32 (truncated)
         let c = Cast::<usize, T> { from: value };
         unsafe { c.to }
@@ -59,31 +72,54 @@ const fn from_usize<T: Unsigned>(value: usize) -> T {
     }
 }
 
+/// MMIO address-space marker.
 #[derive(Copy, Clone, Ord, PartialOrd, Eq, PartialEq, Hash)]
-#[repr(transparent)]
-pub struct IoAddr<T: Unsigned>(T);
+pub enum MmioSpace {}
 
-impl<T: Unsigned> Into<usize> for IoAddr<T> {
+/// I/O virtual address-space marker.
+#[derive(Copy, Clone, Ord, PartialOrd, Eq, PartialEq, Hash)]
+pub enum IoviSpace {}
+
+#[repr(transparent)]
+#[derive(Copy, Clone, Ord, PartialOrd, Eq, PartialEq, Hash)]
+pub struct IoAddr<T: Unsigned, Space>(T, PhantomData<fn() -> Space>);
+
+impl<T: Unsigned, Space> Into<usize> for IoAddr<T, Space> {
     #[inline]
     fn into(self) -> usize {
         into_usize(self.0)
     }
 }
 
-impl<T: Unsigned> From<usize> for IoAddr<T> {
+impl<T: Unsigned, Space> From<usize> for IoAddr<T, Space> {
     #[inline]
     fn from(value: usize) -> Self {
-        Self(from_usize(value))
+        Self(from_usize(value), PhantomData)
     }
 }
 
-impl<T: Unsigned> IoAddr<T>
-where
-    Self: MemoryAddr,
-{
+impl<T: Unsigned, Space> IoAddr<T, Space> {
+    #[inline]
+    pub fn as_usize(&self) -> usize {
+        into_usize(self.0)
+    }
+
+    #[inline]
+    pub fn from_usize(addr: usize) -> Self {
+        Self(from_usize(addr), PhantomData)
+    }
+
+    #[inline]
+    pub fn checked_mul(&self, factor: usize) -> Option<Self> {
+        let current: usize = self.as_usize();
+        current.checked_mul(factor).map(Self::from_usize)
+    }
+}
+
+impl<T: Unsigned> IoAddr<T, MmioSpace> {
     #[inline]
     pub const fn from_phys(addr: PhysAddr) -> Self {
-        Self(from_usize(addr.as_usize()))
+        Self(from_usize(addr.as_usize()), PhantomData)
     }
 
     #[inline]
@@ -92,32 +128,54 @@ where
     }
 }
 
-/// Memory-mapped I/O address. Used for MMIO and IOVA, which share the same
-/// address space and access semantics.
-pub type MmioAddr<T = usize> = IoAddr<T>;
+impl<T: Unsigned, Space> fmt::Debug for IoAddr<T, Space> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "IoAddr({:#x})", self.as_usize())
+    }
+}
 
-/// I/O virtual address. Used for MMIO and IOVA, which share the same address
-/// space and access semantics.
-pub type IoviAddr<T = usize> = IoAddr<T>;
+impl<T: Unsigned, Space> fmt::Display for IoAddr<T, Space> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{:#x}", self.as_usize())
+    }
+}
 
-/// Range of MMIO or IOVA addresses. `end` is exclusive, matching the
-/// convention used by [`AddrRange`] for MMIO / IOVA.
-pub type MmioAddrRange<T = usize> = AddrRange<IoAddr<T>>;
+impl<T: Unsigned, Space> fmt::LowerHex for IoAddr<T, Space> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        fmt::LowerHex::fmt(&self.as_usize(), f)
+    }
+}
 
-/// Range of I/O virtual addresses. `end` is exclusive, matching the
-/// convention used by [`AddrRange`] for MMIO / IOVA.
-pub type IoviAddrRange<T = usize> = AddrRange<IoAddr<T>>;
+impl<T: Unsigned, Space> fmt::UpperHex for IoAddr<T, Space> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        fmt::UpperHex::fmt(&self.as_usize(), f)
+    }
+}
+
+/// Memory-mapped I/O address.
+pub type MmioAddr<T = usize> = IoAddr<T, MmioSpace>;
+
+/// I/O virtual address.
+pub type IoviAddr<T = usize> = IoAddr<T, IoviSpace>;
+
+/// Range of MMIO addresses. `end` is exclusive, matching the convention used
+/// by [`AddrRange`].
+pub type MmioAddrRange<T = usize> = AddrRange<IoAddr<T, MmioSpace>>;
+
+/// Range of I/O virtual addresses. `end` is exclusive, matching the convention
+/// used by [`AddrRange`].
+pub type IoviAddrRange<T = usize> = AddrRange<IoAddr<T, IoviSpace>>;
 
 pub type Mmio32Addr = MmioAddr<u32>;
 pub type Iovi32Addr = IoviAddr<u32>;
 pub type Mmio32AddrRange = MmioAddrRange<u32>;
 pub type Iovi32AddrRange = IoviAddrRange<u32>;
 
-/// Extension methods for MMIO / IOVA address ranges, providing convenient
-/// methods for constructing and accessing registers at fixed offsets from a
-/// base address. These methods return `Option` to reflect the possibility of
-/// out-of-bounds accesses when the offset is too large for the range.
-pub trait MmioAddrRangeExt<T: Unsigned> {
+/// Extension methods for MMIO address ranges, providing convenient methods for
+/// constructing and accessing registers at fixed offsets from a base address.
+/// These methods return `Option` to reflect the possibility of out-of-bounds
+/// accesses when the offset is too large for the range.
+pub trait MmioRange<T: Unsigned> {
     fn from_phys_range(range: PhysAddrRange) -> Self;
     fn as_phys_range(self) -> PhysAddrRange;
     fn reg<const W: usize>(self, offset: usize) -> Option<MmioAddr<T>>;
@@ -130,7 +188,7 @@ pub trait MmioAddrRangeExt<T: Unsigned> {
     fn reg64_aligned(self, offset: usize) -> Option<MmioAddr<T>>;
 }
 
-impl<T: Unsigned> MmioAddrRangeExt<T> for MmioAddrRange<T> {
+impl<T: Unsigned> MmioRange<T> for MmioAddrRange<T> {
     #[inline]
     fn from_phys_range(range: PhysAddrRange) -> Self {
         Self {
@@ -348,10 +406,7 @@ impl fmt::Debug for IoPortRange {
 mod tests {
     use super::*;
 
-    fn assert_mmio_round_trips<T: Unsigned>(samples: &[usize])
-    where
-        MmioAddr<T>: MemoryAddr,
-    {
+    fn assert_mmio_round_trips<T: Unsigned>(samples: &[usize]) {
         for &value in samples {
             let addr = MmioAddr::<T>::from(value);
             let round_trip: usize = addr.into();
@@ -363,18 +418,11 @@ mod tests {
         }
     }
 
-    fn assert_iovi_round_trips<T: Unsigned>(samples: &[usize])
-    where
-        IoviAddr<T>: MemoryAddr,
-    {
+    fn assert_iovi_round_trips<T: Unsigned>(samples: &[usize]) {
         for &value in samples {
             let addr = IoviAddr::<T>::from(value);
             let round_trip: usize = addr.into();
             assert_eq!(round_trip, value);
-
-            let phys = PhysAddr::from_usize(value);
-            let addr = IoviAddr::<T>::from_phys(phys);
-            assert_eq!(addr.as_phys().as_usize(), value);
         }
     }
 
@@ -407,6 +455,15 @@ mod tests {
     #[should_panic]
     fn mmio_addr_u32_rejects_out_of_range_values() {
         let _ = MmioAddr::<u32>::from(u32::MAX as usize + 1);
+    }
+
+    #[cfg(target_pointer_width = "64")]
+    #[test]
+    #[should_panic]
+    fn mmio_addr_u32_checked_add_and_mul_reject_overflows() {
+        let addr = MmioAddr::<u32>::from(0x1000);
+        assert_eq!(addr.checked_add(0x1000).unwrap().as_usize(), 0x2000usize);
+        assert!(addr.checked_add(u32::MAX as usize).is_none());
     }
 
     #[cfg(target_pointer_width = "64")]
