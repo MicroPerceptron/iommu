@@ -1,3 +1,3 @@
-mod acpi;
-mod fdt;
-mod pcie;
+pub mod acpi;
+pub mod fdt;
+pub mod pcie;

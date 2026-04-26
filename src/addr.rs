@@ -175,8 +175,10 @@ pub type Iovi32AddrRange = IoviAddrRange<u32>;
 /// constructing and accessing registers at fixed offsets from a base address.
 /// These methods return `Option` to reflect the possibility of out-of-bounds
 /// accesses when the offset is too large for the range.
-pub trait MmioRange<T: Unsigned> {
+pub trait MmioRange<T: Unsigned>: Sized {
+    fn from_start_size(start: MmioAddr<T>, size: usize) -> Option<Self>;
     fn from_phys_range(range: PhysAddrRange) -> Self;
+    fn from_phys_start_size(start: PhysAddr, size: usize) -> Option<Self>;
     fn as_phys_range(self) -> PhysAddrRange;
     fn reg<const W: usize>(self, offset: usize) -> Option<MmioAddr<T>>;
     fn reg8(self, offset: usize) -> Option<MmioAddr<T>>;
@@ -190,11 +192,21 @@ pub trait MmioRange<T: Unsigned> {
 
 impl<T: Unsigned> MmioRange<T> for MmioAddrRange<T> {
     #[inline]
+    fn from_start_size(start: MmioAddr<T>, size: usize) -> Option<Self> {
+        Self::try_from_start_size(start, size)
+    }
+
+    #[inline]
     fn from_phys_range(range: PhysAddrRange) -> Self {
         Self {
             start: MmioAddr::from_phys(range.start),
             end: MmioAddr::from_phys(range.end),
         }
+    }
+
+    #[inline]
+    fn from_phys_start_size(start: PhysAddr, size: usize) -> Option<Self> {
+        <Self as MmioRange<T>>::from_start_size(MmioAddr::from_phys(start), size)
     }
 
     #[inline]

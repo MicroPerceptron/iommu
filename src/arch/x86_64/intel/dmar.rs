@@ -1,0 +1,876 @@
+//! Intel VT-d DMAR firmware table parsing.
+
+use core::fmt;
+
+use acpi::{
+    AcpiTable, Handler, PhysicalMapping,
+    sdt::{SdtHeader, Signature},
+};
+use memory_addr::{PhysAddr, PhysAddrRange};
+
+use crate::{
+    MmioAddr, MmioAddrRange, MmioRange,
+    firm::{
+        acpi::{AcpiTableBytesError, SdtBytes},
+        pcie::{Bdf, BdfRange, BdfRangeSet, BdfRangeSetError, PciDevice},
+    },
+};
+
+const DMAR_HOST_ADDRESS_WIDTH_OFFSET: usize = 36;
+const DMAR_FLAGS_OFFSET: usize = 37;
+const DMAR_STRUCTURES_OFFSET: usize = 48;
+
+const DMAR_DRHD: u16 = 0;
+const DMAR_RMRR: u16 = 1;
+const DMAR_ATSR: u16 = 2;
+const DMAR_RHSA: u16 = 3;
+const DMAR_SATC: u16 = 5;
+
+const DRHD_MIN_LENGTH: usize = 16;
+const RMRR_MIN_LENGTH: usize = 24;
+const ATSR_MIN_LENGTH: usize = 8;
+const RHSA_MIN_LENGTH: usize = 20;
+const SATC_MIN_LENGTH: usize = 8;
+const DEVICE_SCOPE_HEADER_LENGTH: usize = 6;
+const VTD_REGISTER_WINDOW_SIZE: usize = 0x1000;
+
+const DEVICE_SCOPE_ENDPOINT: u8 = 1;
+const DEVICE_SCOPE_BRIDGE: u8 = 2;
+const DEVICE_SCOPE_IOAPIC: u8 = 3;
+const DEVICE_SCOPE_HPET: u8 = 4;
+const DEVICE_SCOPE_NAMESPACE_DEVICE: u8 = 5;
+
+pub const DMAR_REQUESTER_WINDOW_CAPACITY: usize = 16;
+
+pub type DmarBdfRangeSet = BdfRangeSet<DMAR_REQUESTER_WINDOW_CAPACITY>;
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum DmarError {
+    Table(AcpiTableBytesError),
+    BdfRanges(BdfRangeSetError),
+    Malformed(&'static str),
+}
+
+impl From<AcpiTableBytesError> for DmarError {
+    #[inline]
+    fn from(value: AcpiTableBytesError) -> Self {
+        Self::Table(value)
+    }
+}
+
+impl From<BdfRangeSetError> for DmarError {
+    #[inline]
+    fn from(value: BdfRangeSetError) -> Self {
+        Self::BdfRanges(value)
+    }
+}
+
+impl fmt::Display for DmarError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Table(error) => write!(f, "{error}"),
+            Self::BdfRanges(error) => write!(f, "{error}"),
+            Self::Malformed(message) => f.write_str(message),
+        }
+    }
+}
+
+fn mmio_register_window(
+    base: u64,
+    size: usize,
+    addr_error: &'static str,
+    range_error: &'static str,
+) -> Result<MmioAddrRange, DmarError> {
+    let base = usize::try_from(base).map_err(|_| DmarError::Malformed(addr_error))?;
+    <MmioAddrRange as MmioRange<usize>>::from_start_size(MmioAddr::from(base), size)
+        .ok_or(DmarError::Malformed(range_error))
+}
+
+fn inclusive_phys_range(
+    base: u64,
+    limit: u64,
+    addr_error: &'static str,
+    limit_error: &'static str,
+) -> Result<PhysAddrRange, DmarError> {
+    let base = usize::try_from(base).map_err(|_| DmarError::Malformed(addr_error))?;
+    let end = limit
+        .checked_add(1)
+        .ok_or(DmarError::Malformed(limit_error))?;
+    let end = usize::try_from(end).map_err(|_| DmarError::Malformed(addr_error))?;
+    Ok(PhysAddrRange::new(
+        PhysAddr::from_usize(base),
+        PhysAddr::from_usize(end),
+    ))
+}
+
+#[derive(Clone, Copy, Debug)]
+#[repr(C, packed)]
+pub struct DmarAcpiTable {
+    pub header: SdtHeader,
+}
+
+unsafe impl AcpiTable for DmarAcpiTable {
+    const SIGNATURE: Signature = Signature::DMAR;
+
+    #[inline]
+    fn header(&self) -> &SdtHeader {
+        &self.header
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
+pub struct DmarTable<'a> {
+    sdt: SdtBytes<'a>,
+}
+
+impl<'a> DmarTable<'a> {
+    pub fn parse(bytes: &'a [u8]) -> Result<Self, DmarError> {
+        let sdt = SdtBytes::new(bytes, DmarAcpiTable::SIGNATURE)?;
+        if sdt.len() < DMAR_STRUCTURES_OFFSET {
+            return Err(DmarError::Malformed("DMAR table shorter than fixed header"));
+        }
+        Ok(Self { sdt })
+    }
+
+    pub fn from_acpi_mapping<H>(
+        mapping: &'a PhysicalMapping<H, DmarAcpiTable>,
+    ) -> Result<Self, DmarError>
+    where
+        H: Handler,
+    {
+        let sdt = SdtBytes::from_mapping(mapping, DmarAcpiTable::SIGNATURE)?;
+        if sdt.len() < DMAR_STRUCTURES_OFFSET {
+            return Err(DmarError::Malformed("DMAR table shorter than fixed header"));
+        }
+        Ok(Self { sdt })
+    }
+
+    #[inline]
+    pub const fn bytes(self) -> &'a [u8] {
+        self.sdt.bytes()
+    }
+
+    #[inline]
+    pub fn host_address_width(self) -> Result<u8, DmarError> {
+        Ok(self.sdt.read_u8(DMAR_HOST_ADDRESS_WIDTH_OFFSET)?)
+    }
+
+    #[inline]
+    pub fn flags(self) -> Result<u8, DmarError> {
+        Ok(self.sdt.read_u8(DMAR_FLAGS_OFFSET)?)
+    }
+
+    #[inline]
+    pub fn structures(self) -> DmarStructures<'a> {
+        DmarStructures {
+            table: self,
+            offset: DMAR_STRUCTURES_OFFSET,
+        }
+    }
+
+    pub fn for_each_drhd<F>(self, mut f: F) -> Result<(), DmarError>
+    where
+        F: FnMut(u8, DmarDrhd) -> Result<(), DmarError>,
+    {
+        let host_width = self.host_address_width()?;
+        self.for_each_structure(|structure| {
+            if let DmarStructure::Drhd(unit) = structure {
+                f(host_width, unit)?;
+            }
+            Ok(())
+        })
+    }
+
+    pub fn for_each_rmrr<F>(self, mut f: F) -> Result<(), DmarError>
+    where
+        F: FnMut(DmarRmrr) -> Result<(), DmarError>,
+    {
+        self.for_each_structure(|structure| {
+            if let DmarStructure::Rmrr(region) = structure {
+                f(region)?;
+            }
+            Ok(())
+        })
+    }
+
+    pub fn for_each_atsr<F>(self, mut f: F) -> Result<(), DmarError>
+    where
+        F: FnMut(DmarAtsr) -> Result<(), DmarError>,
+    {
+        self.for_each_structure(|structure| {
+            if let DmarStructure::Atsr(unit) = structure {
+                f(unit)?;
+            }
+            Ok(())
+        })
+    }
+
+    pub fn for_each_rhsa<F>(self, mut f: F) -> Result<(), DmarError>
+    where
+        F: FnMut(DmarRhsa) -> Result<(), DmarError>,
+    {
+        self.for_each_structure(|structure| {
+            if let DmarStructure::Rhsa(affinity) = structure {
+                f(affinity)?;
+            }
+            Ok(())
+        })
+    }
+
+    pub fn for_each_satc<F>(self, mut f: F) -> Result<(), DmarError>
+    where
+        F: FnMut(DmarSatc) -> Result<(), DmarError>,
+    {
+        self.for_each_structure(|structure| {
+            if let DmarStructure::Satc(unit) = structure {
+                f(unit)?;
+            }
+            Ok(())
+        })
+    }
+
+    pub fn drhd_bdf_ranges(
+        self,
+        registers: MmioAddrRange,
+    ) -> Result<Option<DmarBdfRangeSet>, DmarError> {
+        let mut found_unit = false;
+        let mut ranges = DmarBdfRangeSet::empty();
+        let mut unresolved = false;
+
+        self.for_each_structure(|structure| {
+            let DmarStructure::Drhd(unit) = structure else {
+                return Ok(());
+            };
+            if unit.registers != registers {
+                return Ok(());
+            }
+
+            found_unit = true;
+            if unit.include_all {
+                return Ok(());
+            }
+
+            self.walk_device_scopes(
+                unit.structure_offset,
+                DRHD_MIN_LENGTH,
+                unit.length,
+                |scope| {
+                    if let Some(requester) = scope.requester {
+                        ranges.insert::<DmarError>(requester)?;
+                    } else {
+                        unresolved = true;
+                    }
+                    Ok(())
+                },
+            )
+        })?;
+
+        if !found_unit || unresolved || ranges.is_empty() {
+            return Ok(None);
+        }
+        Ok(Some(ranges))
+    }
+
+    pub fn rmrr_bdf_ranges(
+        self,
+        segment: u16,
+        memory: PhysAddrRange,
+    ) -> Result<Option<DmarBdfRangeSet>, DmarError> {
+        let mut found_region = false;
+        let mut ranges = DmarBdfRangeSet::empty();
+        let mut unresolved = false;
+
+        self.for_each_structure(|structure| {
+            let DmarStructure::Rmrr(region) = structure else {
+                return Ok(());
+            };
+            if region.segment != segment || region.memory != memory {
+                return Ok(());
+            }
+
+            found_region = true;
+            self.walk_device_scopes(
+                region.structure_offset,
+                RMRR_MIN_LENGTH,
+                region.length,
+                |scope| {
+                    if let Some(requester) = scope.requester {
+                        ranges.insert::<DmarError>(requester)?;
+                    } else {
+                        unresolved = true;
+                    }
+                    Ok(())
+                },
+            )
+        })?;
+
+        if !found_region || unresolved || ranges.is_empty() {
+            return Ok(None);
+        }
+        Ok(Some(ranges))
+    }
+
+    pub fn drhd_requester_match(
+        self,
+        registers: MmioAddrRange,
+        requester: PciDevice,
+    ) -> Result<Option<DmarRequesterMatch>, DmarError> {
+        let mut match_result = None;
+
+        self.for_each_structure(|structure| {
+            let DmarStructure::Drhd(unit) = structure else {
+                return Ok(());
+            };
+            if unit.registers != registers {
+                return Ok(());
+            }
+
+            if unit.segment != requester.segment() {
+                match_result = Some(DmarRequesterMatch::NotCovered);
+                return Ok(());
+            }
+
+            if unit.include_all {
+                match_result = Some(DmarRequesterMatch::Covered);
+                return Ok(());
+            }
+
+            let mut exact_match = false;
+            let mut unresolved = false;
+            self.walk_device_scopes(
+                unit.structure_offset,
+                DRHD_MIN_LENGTH,
+                unit.length,
+                |scope| {
+                    if let Some(scope_requester) = scope.requester {
+                        if scope_requester.contains(requester.bdf()) {
+                            exact_match = true;
+                        }
+                    } else {
+                        unresolved = true;
+                    }
+                    Ok(())
+                },
+            )?;
+
+            match_result = Some(if exact_match {
+                DmarRequesterMatch::Covered
+            } else if unresolved {
+                DmarRequesterMatch::Unresolved
+            } else {
+                DmarRequesterMatch::NotCovered
+            });
+
+            Ok(())
+        })?;
+
+        Ok(match_result)
+    }
+
+    pub fn satc_device_ats_required(self, requester: PciDevice) -> Result<bool, DmarError> {
+        let mut required = false;
+        self.for_each_structure(|structure| {
+            let DmarStructure::Satc(unit) = structure else {
+                return Ok(());
+            };
+            if unit.segment != requester.segment() || !unit.atc_required || !unit.has_device_scopes
+            {
+                return Ok(());
+            }
+
+            self.walk_device_scopes(
+                unit.structure_offset,
+                SATC_MIN_LENGTH,
+                unit.length,
+                |scope| {
+                    if scope
+                        .requester
+                        .is_some_and(|scope_requester| scope_requester.contains(requester.bdf()))
+                    {
+                        required = true;
+                    }
+                    Ok(())
+                },
+            )
+        })?;
+        Ok(required)
+    }
+
+    pub fn rhsa_proximity_domain_for_registers(
+        self,
+        registers: MmioAddrRange,
+    ) -> Result<Option<u32>, DmarError> {
+        let mut proximity_domain = None;
+        self.for_each_rhsa(|rhsa| {
+            if rhsa.registers == registers {
+                proximity_domain = Some(rhsa.proximity_domain);
+            }
+            Ok(())
+        })?;
+        Ok(proximity_domain)
+    }
+
+    fn for_each_structure<F>(self, mut f: F) -> Result<(), DmarError>
+    where
+        F: FnMut(DmarStructure) -> Result<(), DmarError>,
+    {
+        for structure in self.structures() {
+            f(structure?)?;
+        }
+        Ok(())
+    }
+
+    fn parse_structure(
+        self,
+        offset: usize,
+        length: usize,
+        kind: u16,
+    ) -> Result<DmarStructure, DmarError> {
+        match kind {
+            DMAR_DRHD => Ok(DmarStructure::Drhd(self.parse_drhd(offset, length)?)),
+            DMAR_RMRR => Ok(DmarStructure::Rmrr(self.parse_rmrr(offset, length)?)),
+            DMAR_ATSR => Ok(DmarStructure::Atsr(self.parse_atsr(offset, length)?)),
+            DMAR_RHSA => Ok(DmarStructure::Rhsa(self.parse_rhsa(offset, length)?)),
+            DMAR_SATC => Ok(DmarStructure::Satc(self.parse_satc(offset, length)?)),
+            other => Ok(DmarStructure::Unknown(DmarUnknown {
+                kind: other,
+                offset,
+                length,
+            })),
+        }
+    }
+
+    fn parse_drhd(self, offset: usize, length: usize) -> Result<DmarDrhd, DmarError> {
+        if length < DRHD_MIN_LENGTH {
+            return Err(DmarError::Malformed(
+                "DMAR DRHD structure shorter than minimum",
+            ));
+        }
+        let flags = self.sdt.read_u8(offset + 4)?;
+        Ok(DmarDrhd {
+            flags,
+            segment: self.sdt.read_u16(offset + 6)?,
+            registers: mmio_register_window(
+                self.sdt.read_u64(offset + 8)?,
+                VTD_REGISTER_WINDOW_SIZE,
+                "DMAR DRHD register base cannot fit in usize",
+                "DMAR DRHD register window overflows",
+            )?,
+            include_all: (flags & 0x01) != 0,
+            has_device_scopes: length > DRHD_MIN_LENGTH,
+            structure_offset: offset,
+            length,
+        })
+    }
+
+    fn parse_rmrr(self, offset: usize, length: usize) -> Result<DmarRmrr, DmarError> {
+        if length < RMRR_MIN_LENGTH {
+            return Err(DmarError::Malformed(
+                "DMAR RMRR structure shorter than minimum",
+            ));
+        }
+        let base = self.sdt.read_u64(offset + 8)?;
+        let limit = self.sdt.read_u64(offset + 16)?;
+        if limit < base {
+            return Err(DmarError::Malformed("DMAR RMRR limit smaller than base"));
+        }
+        Ok(DmarRmrr {
+            segment: self.sdt.read_u16(offset + 6)?,
+            memory: inclusive_phys_range(
+                base,
+                limit,
+                "DMAR RMRR address cannot fit in usize",
+                "DMAR RMRR inclusive limit overflows",
+            )?,
+            has_device_scopes: length > RMRR_MIN_LENGTH,
+            structure_offset: offset,
+            length,
+        })
+    }
+
+    fn parse_atsr(self, offset: usize, length: usize) -> Result<DmarAtsr, DmarError> {
+        if length < ATSR_MIN_LENGTH {
+            return Err(DmarError::Malformed(
+                "DMAR ATSR structure shorter than minimum",
+            ));
+        }
+        let flags = self.sdt.read_u8(offset + 4)?;
+        Ok(DmarAtsr {
+            flags,
+            segment: self.sdt.read_u16(offset + 6)?,
+            include_all: (flags & 0x01) != 0,
+            has_device_scopes: length > ATSR_MIN_LENGTH,
+            structure_offset: offset,
+            length,
+        })
+    }
+
+    fn parse_rhsa(self, offset: usize, length: usize) -> Result<DmarRhsa, DmarError> {
+        if length < RHSA_MIN_LENGTH {
+            return Err(DmarError::Malformed(
+                "DMAR RHSA structure shorter than minimum",
+            ));
+        }
+        Ok(DmarRhsa {
+            registers: mmio_register_window(
+                self.sdt.read_u64(offset + 8)?,
+                VTD_REGISTER_WINDOW_SIZE,
+                "DMAR RHSA register base cannot fit in usize",
+                "DMAR RHSA register window overflows",
+            )?,
+            proximity_domain: self.sdt.read_u32(offset + 16)?,
+        })
+    }
+
+    fn parse_satc(self, offset: usize, length: usize) -> Result<DmarSatc, DmarError> {
+        if length < SATC_MIN_LENGTH {
+            return Err(DmarError::Malformed(
+                "DMAR SATC structure shorter than minimum",
+            ));
+        }
+        let flags = self.sdt.read_u8(offset + 4)?;
+        Ok(DmarSatc {
+            flags,
+            segment: self.sdt.read_u16(offset + 6)?,
+            atc_required: (flags & 0x01) != 0,
+            has_device_scopes: length > SATC_MIN_LENGTH,
+            structure_offset: offset,
+            length,
+        })
+    }
+
+    fn walk_device_scopes<F>(
+        self,
+        structure_offset: usize,
+        scopes_offset: usize,
+        structure_length: usize,
+        mut f: F,
+    ) -> Result<(), DmarError>
+    where
+        F: FnMut(DmarDeviceScope) -> Result<(), DmarError>,
+    {
+        let mut offset = scopes_offset;
+        while offset < structure_length {
+            if offset + DEVICE_SCOPE_HEADER_LENGTH > structure_length {
+                return Err(DmarError::Malformed(
+                    "DMAR device scope truncated before fixed header",
+                ));
+            }
+
+            let scope_offset = structure_offset + offset;
+            let scope_length = usize::from(self.sdt.read_u8(scope_offset + 1)?);
+            if scope_length < DEVICE_SCOPE_HEADER_LENGTH {
+                return Err(DmarError::Malformed(
+                    "DMAR device scope shorter than minimum",
+                ));
+            }
+            if offset + scope_length > structure_length {
+                return Err(DmarError::Malformed(
+                    "DMAR device scope extends past structure",
+                ));
+            }
+
+            let path_bytes = scope_length - DEVICE_SCOPE_HEADER_LENGTH;
+            if (path_bytes & 1) != 0 {
+                return Err(DmarError::Malformed(
+                    "DMAR device scope path has odd byte length",
+                ));
+            }
+
+            let mut last_device = None;
+            let mut last_function = None;
+            let mut path_offset = DEVICE_SCOPE_HEADER_LENGTH;
+            while path_offset < scope_length {
+                last_device = Some(self.sdt.read_u8(scope_offset + path_offset)?);
+                last_function = Some(self.sdt.read_u8(scope_offset + path_offset + 1)?);
+                path_offset += 2;
+            }
+            let start_bus = self.sdt.read_u8(scope_offset + 5)?;
+            let path_depth = path_bytes / 2;
+            let requester = match (last_device, last_function) {
+                (Some(device), Some(function)) if path_depth == 1 => {
+                    Bdf::new(start_bus, device, function)
+                        .ok()
+                        .map(BdfRange::single)
+                }
+                _ => None,
+            };
+
+            f(DmarDeviceScope {
+                kind: DmarDeviceScopeKind::from_raw(self.sdt.read_u8(scope_offset)?),
+                enumeration_id: self.sdt.read_u8(scope_offset + 4)?,
+                requester,
+            })?;
+
+            offset += scope_length;
+        }
+        Ok(())
+    }
+}
+
+pub struct DmarStructures<'a> {
+    table: DmarTable<'a>,
+    offset: usize,
+}
+
+impl Iterator for DmarStructures<'_> {
+    type Item = Result<DmarStructure, DmarError>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        if self.offset >= self.table.sdt.len() {
+            return None;
+        }
+        if self.offset + 4 > self.table.sdt.len() {
+            self.offset = self.table.sdt.len();
+            return Some(Err(DmarError::Malformed(
+                "DMAR structure truncated before header",
+            )));
+        }
+
+        let offset = self.offset;
+        let kind = match self.table.sdt.read_u16(offset) {
+            Ok(kind) => kind,
+            Err(error) => return Some(Err(error.into())),
+        };
+        let length = match self.table.sdt.read_u16(offset + 2) {
+            Ok(length) => usize::from(length),
+            Err(error) => return Some(Err(error.into())),
+        };
+        if length < 4 {
+            self.offset = self.table.sdt.len();
+            return Some(Err(DmarError::Malformed(
+                "DMAR structure length smaller than header",
+            )));
+        }
+        if offset + length > self.table.sdt.len() {
+            self.offset = self.table.sdt.len();
+            return Some(Err(DmarError::Malformed(
+                "DMAR structure extends past table length",
+            )));
+        }
+
+        self.offset += length;
+        Some(self.table.parse_structure(offset, length, kind))
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DmarStructure {
+    Drhd(DmarDrhd),
+    Rmrr(DmarRmrr),
+    Atsr(DmarAtsr),
+    Rhsa(DmarRhsa),
+    Satc(DmarSatc),
+    Unknown(DmarUnknown),
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct DmarUnknown {
+    pub kind: u16,
+    pub offset: usize,
+    pub length: usize,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct DmarDrhd {
+    pub flags: u8,
+    pub segment: u16,
+    pub registers: MmioAddrRange,
+    pub include_all: bool,
+    pub has_device_scopes: bool,
+    structure_offset: usize,
+    length: usize,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct DmarRmrr {
+    pub segment: u16,
+    pub memory: PhysAddrRange,
+    pub has_device_scopes: bool,
+    structure_offset: usize,
+    length: usize,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct DmarAtsr {
+    pub flags: u8,
+    pub segment: u16,
+    pub include_all: bool,
+    pub has_device_scopes: bool,
+    structure_offset: usize,
+    length: usize,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct DmarRhsa {
+    pub registers: MmioAddrRange,
+    pub proximity_domain: u32,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct DmarSatc {
+    pub flags: u8,
+    pub segment: u16,
+    pub atc_required: bool,
+    pub has_device_scopes: bool,
+    structure_offset: usize,
+    length: usize,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct DmarDeviceScope {
+    pub kind: DmarDeviceScopeKind,
+    pub enumeration_id: u8,
+    pub requester: Option<BdfRange>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DmarDeviceScopeKind {
+    Endpoint,
+    Bridge,
+    IoApic,
+    Hpet,
+    NamespaceDevice,
+    Unknown(u8),
+}
+
+impl DmarDeviceScopeKind {
+    #[inline]
+    const fn from_raw(raw: u8) -> Self {
+        match raw {
+            DEVICE_SCOPE_ENDPOINT => Self::Endpoint,
+            DEVICE_SCOPE_BRIDGE => Self::Bridge,
+            DEVICE_SCOPE_IOAPIC => Self::IoApic,
+            DEVICE_SCOPE_HPET => Self::Hpet,
+            DEVICE_SCOPE_NAMESPACE_DEVICE => Self::NamespaceDevice,
+            other => Self::Unknown(other),
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DmarRequesterMatch {
+    Covered,
+    NotCovered,
+    Unresolved,
+}
+
+pub use crate::firm::pcie::BdfRange as DmarBdfRange;
+
+#[cfg(test)]
+mod tests {
+    use super::{DmarBdfRange, DmarRequesterMatch, DmarStructure, DmarTable};
+    use crate::firm::pcie::{Bdf, PciDevice};
+    use crate::{MmioAddr, MmioAddrRange, MmioRange};
+    use acpi::sdt::Signature;
+
+    fn registers(base: usize) -> MmioAddrRange {
+        <MmioAddrRange as MmioRange<usize>>::from_start_size(
+            MmioAddr::from(base),
+            super::VTD_REGISTER_WINDOW_SIZE,
+        )
+        .unwrap()
+    }
+
+    fn write_sdt_header(bytes: &mut [u8], signature: Signature, length: usize) {
+        bytes[0..4].copy_from_slice(signature.as_str().as_bytes());
+        bytes[4..8].copy_from_slice(&(length as u32).to_le_bytes());
+        bytes[8] = 1;
+    }
+
+    #[test]
+    fn parses_drhd_and_exact_bdf_ranges() {
+        let mut dmar = [0u8; 88];
+        write_sdt_header(&mut dmar, Signature::DMAR, 88);
+        dmar[36] = 47;
+
+        dmar[48..50].copy_from_slice(&0u16.to_le_bytes());
+        dmar[50..52].copy_from_slice(&40u16.to_le_bytes());
+        dmar[54..56].copy_from_slice(&3u16.to_le_bytes());
+        dmar[56..64].copy_from_slice(&(0xfed9_0000u64).to_le_bytes());
+
+        for (offset, function) in [(64, 0u8), (72, 1u8), (80, 2u8)] {
+            dmar[offset] = 1;
+            dmar[offset + 1] = 8;
+            dmar[offset + 5] = 0x2a;
+            dmar[offset + 6] = 5;
+            dmar[offset + 7] = function;
+        }
+
+        let table = DmarTable::parse(&dmar).unwrap();
+        assert_eq!(table.host_address_width().unwrap(), 47);
+
+        let units: heapless::Vec<_, 2> = table.structures().collect::<Result<_, _>>().unwrap();
+        assert!(matches!(units.as_slice(), [DmarStructure::Drhd(unit)] if unit.segment == 3));
+
+        let windows = table
+            .drhd_bdf_ranges(registers(0xfed9_0000))
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            windows.as_slice(),
+            &[DmarBdfRange::inclusive(
+                Bdf::new(0x2a, 5, 0).unwrap(),
+                Bdf::new(0x2a, 5, 2).unwrap()
+            )
+            .unwrap()]
+        );
+        assert_eq!(
+            table
+                .drhd_requester_match(
+                    registers(0xfed9_0000),
+                    PciDevice::new(3, 0x2a, 5, 1).unwrap()
+                )
+                .unwrap(),
+            Some(DmarRequesterMatch::Covered)
+        );
+    }
+
+    #[test]
+    fn parses_reserved_memory_affinity_and_satc() {
+        let mut dmar = [0u8; 100];
+        write_sdt_header(&mut dmar, Signature::DMAR, 100);
+        dmar[36] = 47;
+
+        dmar[48..50].copy_from_slice(&1u16.to_le_bytes());
+        dmar[50..52].copy_from_slice(&24u16.to_le_bytes());
+        dmar[54..56].copy_from_slice(&2u16.to_le_bytes());
+        dmar[56..64].copy_from_slice(&(0x1000_0000u64).to_le_bytes());
+        dmar[64..72].copy_from_slice(&(0x1000_ffffu64).to_le_bytes());
+
+        dmar[72..74].copy_from_slice(&3u16.to_le_bytes());
+        dmar[74..76].copy_from_slice(&20u16.to_le_bytes());
+        dmar[80..88].copy_from_slice(&(0xfed9_1000u64).to_le_bytes());
+        dmar[88..92].copy_from_slice(&9u32.to_le_bytes());
+
+        dmar[92..94].copy_from_slice(&5u16.to_le_bytes());
+        dmar[94..96].copy_from_slice(&8u16.to_le_bytes());
+        dmar[96] = 1;
+        dmar[98..100].copy_from_slice(&2u16.to_le_bytes());
+
+        let table = DmarTable::parse(&dmar).unwrap();
+        let mut rmrr = None;
+        table
+            .for_each_rmrr(|region| {
+                rmrr = Some(region);
+                Ok(())
+            })
+            .unwrap();
+        assert_eq!(rmrr.unwrap().segment, 2);
+        assert_eq!(
+            table
+                .rhsa_proximity_domain_for_registers(registers(0xfed9_1000))
+                .unwrap(),
+            Some(9)
+        );
+
+        let mut satc = None;
+        table
+            .for_each_satc(|unit| {
+                satc = Some(unit);
+                Ok(())
+            })
+            .unwrap();
+        assert!(satc.unwrap().atc_required);
+    }
+}
