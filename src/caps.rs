@@ -47,44 +47,44 @@ pub enum TranslationStage {
 pub enum BindingSelector {
     #[default]
     Default,
-    AddrSpaceId(u32),
-    SubstreamId(u32),
+    AddrSpace(u32),
+    Substream(u32),
 }
 
 impl BindingSelector {
     #[inline]
-    pub const fn aspace_id(id: u32) -> Self {
-        Self::AddrSpaceId(id)
+    pub const fn from_addr_space(id: u32) -> Self {
+        Self::AddrSpace(id)
     }
 
     #[inline]
-    pub const fn substream_id(id: u32) -> Self {
-        Self::SubstreamId(id)
+    pub const fn from_substream(id: u32) -> Self {
+        Self::Substream(id)
     }
 }
 
 /// Translation target bound to one client selector.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum BindingTarget<Space> {
+pub enum BindingTarget<Domain> {
     Abort,
     PassThrough,
-    AddrSpace(Space),
+    Domain(Domain),
 }
 
 /// One client binding request.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct Binding<Client, Space> {
+pub struct Binding<Client, Domain> {
     client: Client,
     selector: BindingSelector,
-    target: BindingTarget<Space>,
+    target: BindingTarget<Domain>,
 }
 
-impl<Client, Space> Binding<Client, Space> {
+impl<Client, Domain> Binding<Client, Domain> {
     #[inline]
     pub const fn new(
         client: Client,
         selector: BindingSelector,
-        target: BindingTarget<Space>,
+        target: BindingTarget<Domain>,
     ) -> Self {
         Self {
             client,
@@ -107,9 +107,9 @@ impl<Client, Space> Binding<Client, Space> {
     }
 
     #[inline]
-    pub fn target(self) -> BindingTarget<Space>
+    pub fn target(self) -> BindingTarget<Domain>
     where
-        Space: Copy,
+        Domain: Copy,
     {
         self.target
     }

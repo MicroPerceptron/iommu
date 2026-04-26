@@ -5,13 +5,13 @@ use memory_addr::MemoryAddr;
 
 use crate::{Binding, BindingSelector, Error, IoviAddr, PageSize, Result, TranslationStage};
 
-/// DMA/IOMMU invalidation contract.
+/// IOTLB invalidation contract.
 ///
 /// The supertrait is the CPU-side `kpte` invalidation hook. Device-facing
 /// implementations can therefore be passed directly into a `kpte` map/unmap
 /// call while also carrying IOTLB and device-TLB invalidation primitives for
 /// the controller's post-write hardware synchronization.
-pub trait DmaTlbInvalidation<V: MemoryAddr = IoviAddr>: TlbInvalidation<V> {
+pub trait IoTlbInvalidation<V: MemoryAddr = IoviAddr>: TlbInvalidation<V> {
     type Client: Copy + Debug + Eq;
 
     fn flush_iotlb(&self, iova: V);
@@ -49,18 +49,18 @@ pub trait DmaTlbInvalidation<V: MemoryAddr = IoviAddr>: TlbInvalidation<V> {
     }
 }
 
-/// No-op DMA invalidator for host tests and pre-hardware table construction.
+/// No-op IOTLB invalidator for host tests and pre-hardware table construction.
 #[derive(Clone, Copy, Debug, Default)]
-pub struct NoDmaFlush<Client = ()>(PhantomData<fn() -> Client>);
+pub struct NoIoTlbFlush<Client = ()>(PhantomData<fn() -> Client>);
 
-impl<Client> NoDmaFlush<Client> {
+impl<Client> NoIoTlbFlush<Client> {
     #[inline]
     pub const fn new() -> Self {
         Self(PhantomData)
     }
 }
 
-impl<V, Client> TlbInvalidation<V> for NoDmaFlush<Client>
+impl<V, Client> TlbInvalidation<V> for NoIoTlbFlush<Client>
 where
     V: MemoryAddr,
     Client: Copy + Debug + Eq + 'static,
@@ -80,7 +80,7 @@ where
     }
 }
 
-impl<V, Client> DmaTlbInvalidation<V> for NoDmaFlush<Client>
+impl<V, Client> IoTlbInvalidation<V> for NoIoTlbFlush<Client>
 where
     V: MemoryAddr,
     Client: Copy + Debug + Eq + 'static,
@@ -141,7 +141,7 @@ pub enum Invalidate<Client, V = IoviAddr> {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum InvalidateScope {
     Global,
-    AddrSpace,
+    Domain,
     Leaf,
     Device,
     DeviceLeaf,
@@ -180,15 +180,15 @@ impl InvalidateOutcome {
 pub trait Controller<V: MemoryAddr = IoviAddr>: PageTable<V> {
     type Info;
     type Client: Copy + Debug + Eq;
-    type AddrSpace: Copy + Debug + Eq;
-    type Invalidator: DmaTlbInvalidation<V, Client = Self::Client>;
+    type Domain: Copy + Debug + Eq;
+    type Invalidator: IoTlbInvalidation<V, Client = Self::Client>;
     type Fault;
 
     fn info(&self) -> &Self::Info;
-    fn aspace(&self) -> Self::AddrSpace;
+    fn domain(&self) -> Self::Domain;
     fn stage(&self) -> TranslationStage;
     fn enable(&mut self) -> Result;
-    fn bind(&mut self, binding: Binding<Self::Client, Self::AddrSpace>) -> Result;
+    fn bind(&mut self, binding: Binding<Self::Client, Self::Domain>) -> Result;
     fn unbind(&mut self, client: Self::Client, selector: BindingSelector) -> Result;
     fn invalidator(&self) -> &Self::Invalidator;
     fn invalidate(&mut self, request: Invalidate<Self::Client, V>) -> Result<InvalidateOutcome>;

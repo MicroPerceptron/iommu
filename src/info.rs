@@ -15,7 +15,7 @@ pub enum ControllerKind {
 
 /// Immutable descriptor for one discovered IOMMU unit.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct UnitInfo {
+pub struct IommuInfo {
     kind: ControllerKind,
     segment: Option<u16>,
     mmio: MmioAddrRange,
@@ -23,7 +23,7 @@ pub struct UnitInfo {
     stage: TranslationStage,
 }
 
-impl UnitInfo {
+impl IommuInfo {
     #[inline]
     pub const fn new(
         kind: ControllerKind,

@@ -5,7 +5,7 @@ use core::fmt;
 use memory_addr::PhysAddr;
 
 use crate::{
-    AccessFlags, CachePolicy, IoviAddr, MemoryAttributes, PageSize, PageTableEntry,
+    AccessFlags, CachePolicy, DmaAttrs, IoviAddr, MemoryAttributes, PageSize, PageTableEntry,
     PageTableEntryKind, PageTableWalker, PagingMetaData,
 };
 
@@ -15,6 +15,54 @@ const WRITE: u64 = 1 << 1;
 const SUPER_PAGE: u64 = 1 << 7;
 const PRESENT: u64 = READ | WRITE;
 
+/// Intel VT-d second-level adjusted guest address width.
+///
+/// VT-d encodes second-level paging support as adjusted guest address widths
+/// (AGAW). For 4 KiB granules these correspond to the same 3/4/5-level shapes
+/// used by x86 page tables: 39, 48, and 57 address bits.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[repr(u8)]
+pub enum VtdSecondLevelAddressWidth {
+    Bits39 = 39,
+    Bits48 = 48,
+    Bits57 = 57,
+}
+
+impl VtdSecondLevelAddressWidth {
+    #[inline]
+    pub const fn bits(self) -> u8 {
+        self as u8
+    }
+
+    #[inline]
+    pub const fn levels(self) -> usize {
+        match self {
+            Self::Bits39 => 3,
+            Self::Bits48 => 4,
+            Self::Bits57 => 5,
+        }
+    }
+
+    #[inline]
+    pub const fn sagaw_bit(self) -> u8 {
+        match self {
+            Self::Bits39 => 1 << 1,
+            Self::Bits48 => 1 << 2,
+            Self::Bits57 => 1 << 3,
+        }
+    }
+
+    #[inline]
+    pub const fn from_bits(bits: u8) -> Option<Self> {
+        match bits {
+            39 => Some(Self::Bits39),
+            48 => Some(Self::Bits48),
+            57 => Some(Self::Bits57),
+            _ => None,
+        }
+    }
+}
+
 /// Intel VT-d second-level PTE flags.
 ///
 /// VT-d second-level leaves encode read/write permission directly. Cache,
@@ -22,8 +70,8 @@ const PRESENT: u64 = READ | WRITE;
 /// value for API symmetry, but this descriptor format does not encode them.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct VtdSecondLevelFlags {
-    pub access: AccessFlags,
-    pub attrs: MemoryAttributes,
+    access: AccessFlags,
+    attrs: MemoryAttributes,
 }
 
 impl VtdSecondLevelFlags {
@@ -45,6 +93,16 @@ impl VtdSecondLevelFlags {
     pub const fn with_attrs(mut self, attrs: MemoryAttributes) -> Self {
         self.attrs = attrs;
         self
+    }
+
+    #[inline]
+    pub const fn access(self) -> AccessFlags {
+        self.access
+    }
+
+    #[inline]
+    pub const fn attrs(self) -> MemoryAttributes {
+        self.attrs
     }
 
     #[inline(always)]
@@ -75,6 +133,20 @@ impl VtdSecondLevelFlags {
             access,
             attrs: MemoryAttributes::writeback(),
         }
+    }
+}
+
+impl From<DmaAttrs> for VtdSecondLevelFlags {
+    #[inline]
+    fn from(value: DmaAttrs) -> Self {
+        Self::new(value.access()).with_attrs(value.memory())
+    }
+}
+
+impl From<VtdSecondLevelFlags> for DmaAttrs {
+    #[inline]
+    fn from(value: VtdSecondLevelFlags) -> Self {
+        Self::new(value.access, value.attrs)
     }
 }
 
@@ -198,8 +270,8 @@ mod tests {
         assert_eq!(pte.entry_kind(2), PageTableEntryKind::Leaf);
         assert_eq!(pte.bits() & SUPER_PAGE, SUPER_PAGE);
         assert_eq!(pte.paddr(), PhysAddr::from_usize(0x20_0000));
-        assert!(pte.flags().access.contains(AccessFlags::READ));
-        assert!(pte.flags().access.contains(AccessFlags::WRITE));
+        assert!(pte.flags().access().contains(AccessFlags::READ));
+        assert!(pte.flags().access().contains(AccessFlags::WRITE));
     }
 
     #[test]
@@ -207,5 +279,15 @@ mod tests {
         let pte = VtdSecondLevelPte::new_table(PhysAddr::from_usize(0x4000), 4);
         assert_eq!(pte.entry_kind(4), PageTableEntryKind::Table);
         assert_eq!(pte.paddr(), PhysAddr::from_usize(0x4000));
+    }
+
+    #[test]
+    fn address_widths_match_vtd_agaw_shapes() {
+        assert_eq!(VtdSecondLevelAddressWidth::Bits39.levels(), 3);
+        assert_eq!(VtdSecondLevelAddressWidth::Bits48.levels(), 4);
+        assert_eq!(VtdSecondLevelAddressWidth::Bits57.levels(), 5);
+        assert_eq!(VtdSecondLevelAddressWidth::Bits39.sagaw_bit(), 0b0010);
+        assert_eq!(VtdSecondLevelAddressWidth::Bits48.sagaw_bit(), 0b0100);
+        assert_eq!(VtdSecondLevelAddressWidth::Bits57.sagaw_bit(), 0b1000);
     }
 }

@@ -121,7 +121,7 @@ impl PciDevice {
     }
 
     #[inline]
-    pub fn from_address(address: PciAddress) -> Result<Self, PciDeviceError> {
+    pub fn from_addr(address: PciAddress) -> Result<Self, PciDeviceError> {
         Self::new(
             address.segment(),
             address.bus(),
@@ -133,16 +133,6 @@ impl PciDevice {
     #[inline]
     pub fn as_addr(self) -> PciAddress {
         PciAddress::new(self.segment(), self.bus(), self.device(), self.function())
-    }
-
-    #[inline]
-    pub const fn from_u32(packed: u32) -> Self {
-        Self(packed)
-    }
-
-    #[inline]
-    pub const fn as_u32(self) -> u32 {
-        self.0
     }
 
     #[inline]

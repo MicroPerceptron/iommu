@@ -55,12 +55,10 @@ fn write_signature(f: &mut fmt::Formatter<'_>, signature: [u8; 4]) -> fmt::Resul
 }
 
 #[derive(Clone, Copy, Debug)]
-#[allow(dead_code)]
 pub(crate) struct SdtBytes<'a> {
     bytes: &'a [u8],
 }
 
-#[allow(dead_code)]
 impl<'a> SdtBytes<'a> {
     pub(crate) fn new_for<T: AcpiTable>(bytes: &'a [u8]) -> Result<Self, AcpiTableBytesError> {
         Self::new(bytes, T::SIGNATURE)
