@@ -22,9 +22,11 @@
 //! Consumers must install the PAT value on every CPU before activating
 //! [`crate::CachePolicy::WriteCombine`] mappings.
 
+mod activation;
 mod entry;
 mod tlb;
 
+pub use activation::{X86Cr3Mode, X86PagingActivation, X86PagingControls, X86PagingToken};
 pub use entry::{
     X86_PAT_MSR, X86_PAT_MSR_VALUE, X86_PAT_TYPE_UC, X86_PAT_TYPE_UC_MINUS, X86_PAT_TYPE_WB,
     X86_PAT_TYPE_WC, X86_PAT_TYPE_WP, X86_PAT_TYPE_WT, X86_PAT_UNCACHED_INDEX,

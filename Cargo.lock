@@ -107,7 +107,7 @@ dependencies = [
 
 [[package]]
 name = "iommu"
-version = "0.6.0"
+version = "0.7.0"
 dependencies = [
  "aarch64-cpu 11.2.0",
  "aarch64-cpu-ext",
@@ -128,6 +128,7 @@ dependencies = [
  "aarch64-cpu-ext",
  "heapless",
  "memory_addr",
+ "riscv",
  "x86_64",
 ]
 

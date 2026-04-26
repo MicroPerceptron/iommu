@@ -1,8 +1,46 @@
 //! Intel VT-d controller-side descriptor helpers.
 
-use crate::{IoviAddr, PageSize, PciDevice, Result};
+use kpte::{Mapping, PageTableEntry};
+use memory_addr::{PhysAddrRange, VirtAddr};
 
-use super::{caps::VtdCapability, error::VtdError, info::VtdDomainId};
+use crate::{CommandQueue, IoviAddr, MmioAddrRange, MmioRange, PageSize, PciDevice, Result};
+
+use super::{
+    caps::{VtdCapability, VtdExtendedCapability},
+    error::VtdError,
+    info::{VtdIoDomain, VtdVersion},
+};
+
+pub type VtdQueuedInvalidationQueue<const N: usize> = CommandQueue<N>;
+
+pub const REG_VERSION: usize = 0x00;
+pub const REG_CAP: usize = 0x08;
+pub const REG_ECAP: usize = 0x10;
+pub const REG_GCMD: usize = 0x18;
+pub const REG_GSTS: usize = 0x1c;
+pub const REG_RTADDR: usize = 0x20;
+pub const REG_CCMD: usize = 0x28;
+pub const REG_FSTS: usize = 0x34;
+pub const REG_FECTL: usize = 0x38;
+pub const REG_FEDATA: usize = 0x3c;
+pub const REG_FEADDR: usize = 0x40;
+pub const REG_FEUADDR: usize = 0x44;
+pub const REG_IQH: usize = 0x80;
+pub const REG_IQT: usize = 0x88;
+pub const REG_IQA: usize = 0x90;
+pub const REG_IRTA: usize = 0xb8;
+
+pub const GCMD_TE: u32 = 1 << 31;
+pub const GCMD_SRTP: u32 = 1 << 30;
+pub const GCMD_QIE: u32 = 1 << 26;
+pub const GCMD_IRE: u32 = 1 << 25;
+pub const GCMD_SIRTP: u32 = 1 << 24;
+
+pub const GSTS_TES: u32 = 1 << 31;
+pub const GSTS_RTPS: u32 = 1 << 30;
+pub const GSTS_QIES: u32 = 1 << 26;
+pub const GSTS_IRES: u32 = 1 << 25;
+pub const GSTS_IRTPS: u32 = 1 << 24;
 
 const QI_CC_TYPE: u64 = 0x1;
 const QI_IOTLB_TYPE: u64 = 0x2;
@@ -24,6 +62,102 @@ const QI_IEC_IDX_SHIFT: u64 = 32;
 
 const PAGE_ADDR_MASK: u64 = !0xfff_u64;
 const IVA_AM_MASK: u64 = 0x3f;
+
+/// Mapped VT-d register window.
+///
+/// The caller owns how the MMIO page is mapped. Once handed to this wrapper,
+/// register access goes through the volatile helpers already provided by
+/// `kpte::Mapping`, keeping VT-d code out of the raw pointer business.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct VtdRegisterWindow<Entry>
+where
+    Entry: PageTableEntry,
+{
+    mapping: Mapping<Entry, VirtAddr>,
+}
+
+impl<Entry> VtdRegisterWindow<Entry>
+where
+    Entry: PageTableEntry,
+{
+    #[inline]
+    pub const fn new(mapping: Mapping<Entry, VirtAddr>) -> Self {
+        Self { mapping }
+    }
+
+    #[inline]
+    pub const fn mapping(&self) -> &Mapping<Entry, VirtAddr> {
+        &self.mapping
+    }
+
+    #[inline]
+    pub const fn mapping_mut(&mut self) -> &mut Mapping<Entry, VirtAddr> {
+        &mut self.mapping
+    }
+
+    #[inline]
+    pub fn mmio_range(&self) -> MmioAddrRange {
+        <MmioAddrRange as MmioRange<usize>>::from_phys_range(PhysAddrRange::from_start_size(
+            self.mapping.paddr,
+            self.mapping.range.size(),
+        ))
+    }
+
+    #[inline]
+    pub fn read32(&self, offset: usize) -> Result<u32> {
+        self.mapping.read_vo32(offset).map_err(Into::into)
+    }
+
+    #[inline]
+    pub fn write32(&mut self, offset: usize, value: u32) -> Result {
+        self.mapping.write_vo32(offset, value).map_err(Into::into)
+    }
+
+    #[inline]
+    pub fn modify32(&mut self, offset: usize, f: impl FnOnce(u32) -> u32) -> Result<u32> {
+        self.mapping.modify_vo32(offset, f).map_err(Into::into)
+    }
+
+    #[inline]
+    pub fn read64(&self, offset: usize) -> Result<u64> {
+        self.mapping.read_vo64(offset).map_err(Into::into)
+    }
+
+    #[inline]
+    pub fn write64(&mut self, offset: usize, value: u64) -> Result {
+        self.mapping.write_vo64(offset, value).map_err(Into::into)
+    }
+
+    #[inline]
+    pub fn modify64(&mut self, offset: usize, f: impl FnOnce(u64) -> u64) -> Result<u64> {
+        self.mapping.modify_vo64(offset, f).map_err(Into::into)
+    }
+
+    #[inline]
+    pub fn version(&self) -> Result<VtdVersion> {
+        self.read32(REG_VERSION).map(VtdVersion::from_bits)
+    }
+
+    #[inline]
+    pub fn capability(&self) -> Result<VtdCapability> {
+        self.read64(REG_CAP).map(VtdCapability::from_bits)
+    }
+
+    #[inline]
+    pub fn extended_capability(&self) -> Result<VtdExtendedCapability> {
+        self.read64(REG_ECAP).map(VtdExtendedCapability::from_bits)
+    }
+
+    #[inline]
+    pub fn global_status(&self) -> Result<u32> {
+        self.read32(REG_GSTS)
+    }
+
+    #[inline]
+    pub fn global_command(&mut self, command: u32) -> Result {
+        self.write32(REG_GCMD, command)
+    }
+}
 
 /// Raw queued-invalidation descriptor, ready to be written to a VT-d QI ring.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -50,6 +184,22 @@ impl VtdQueuedInvalidationDescriptor {
     }
 
     #[inline]
+    pub fn submit_to<const N: usize, RH, WT, CE>(
+        self,
+        queue: &VtdQueuedInvalidationQueue<N>,
+        read_head: RH,
+        write_tail: WT,
+        check_error: CE,
+    ) -> Result
+    where
+        RH: Fn() -> usize,
+        WT: Fn(usize),
+        CE: Fn() -> Result,
+    {
+        queue.submit128(self.low, self.high, read_head, write_tail, check_error)
+    }
+
+    #[inline]
     pub const fn context_global() -> Self {
         Self::from_words(QI_CC_TYPE | QI_CC_GLOBAL, 0)
     }
@@ -68,19 +218,19 @@ impl VtdQueuedInvalidationDescriptor {
     }
 
     #[inline]
-    pub const fn iotlb_domain(domain: VtdDomainId, cap: VtdCapability) -> Self {
+    pub const fn iotlb_domain(domain: VtdIoDomain, cap: VtdCapability) -> Self {
         Self::from_words(
             QI_IOTLB_TYPE
                 | QI_IOTLB_DOMAIN
                 | iotlb_drain_bits(cap)
-                | ((domain.as_u16() as u64) << QI_IOTLB_DID_SHIFT),
+                | ((domain.id() as u64) << QI_IOTLB_DID_SHIFT),
             0,
         )
     }
 
     #[inline]
     pub fn iotlb_page(
-        domain: VtdDomainId,
+        domain: VtdIoDomain,
         iova: IoviAddr<u64>,
         granule: PageSize,
         cap: VtdCapability,
@@ -93,7 +243,7 @@ impl VtdQueuedInvalidationDescriptor {
             QI_IOTLB_TYPE
                 | QI_IOTLB_PAGE
                 | iotlb_drain_bits(cap)
-                | ((domain.as_u16() as u64) << QI_IOTLB_DID_SHIFT),
+                | ((domain.id() as u64) << QI_IOTLB_DID_SHIFT),
             ((iova.as_usize() as u64) & PAGE_ADDR_MASK)
                 | u64::from(address_mask & IVA_AM_MASK as u8),
         ))
@@ -140,6 +290,9 @@ const fn iotlb_drain_bits(cap: VtdCapability) -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use memory_addr::{PhysAddr, PhysAddrRange, VirtAddr, VirtAddrRange};
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::vec;
 
     const CAP_PSI: u64 = 1 << 39;
     const CAP_MAMV_SHIFT: u64 = 48;
@@ -156,7 +309,7 @@ mod tests {
     fn page_iotlb_descriptor_encodes_address_mask() {
         let cap = VtdCapability::from_bits(CAP_PSI | (18_u64 << CAP_MAMV_SHIFT));
         let desc = VtdQueuedInvalidationDescriptor::iotlb_page(
-            VtdDomainId::new(7),
+            VtdIoDomain::from_asid(7).unwrap(),
             IoviAddr::<u64>::from(0x4000_1234),
             PageSize::Size1G,
             cap,
@@ -166,5 +319,40 @@ mod tests {
         assert_eq!((desc.low() >> QI_IOTLB_DID_SHIFT) & 0xffff, 7);
         assert_eq!(desc.high() & PAGE_ADDR_MASK, 0x4000_1000);
         assert_eq!(desc.high() & IVA_AM_MASK, 18);
+    }
+
+    #[test]
+    fn queued_invalidation_descriptor_submits_to_command_queue() {
+        const ENTRIES: usize = 4;
+        const ENTRY_BYTES: usize = 16;
+
+        let buffer = vec![0u8; ENTRIES * ENTRY_BYTES];
+        let phys = PhysAddrRange::from_start_size(
+            PhysAddr::from_usize(buffer.as_ptr() as usize),
+            buffer.len(),
+        );
+        let virt = VirtAddrRange::from_start_size(
+            VirtAddr::from_usize(buffer.as_ptr() as usize),
+            buffer.len(),
+        );
+        let backing =
+            unsafe { crate::CommandQueueBacking::new(phys, virt, ENTRIES, ENTRY_BYTES) }.unwrap();
+        let mut queue: VtdQueuedInvalidationQueue<ENTRIES> = VtdQueuedInvalidationQueue::new();
+        queue.init(backing).unwrap();
+
+        let head = AtomicUsize::new(0);
+        let desc = VtdQueuedInvalidationDescriptor::context_global();
+        desc.submit_to(
+            &queue,
+            || head.load(Ordering::Acquire),
+            |tail| head.store(tail, Ordering::Release),
+            || Ok(()),
+        )
+        .unwrap();
+
+        let low = u64::from_ne_bytes(buffer[0..8].try_into().unwrap());
+        let high = u64::from_ne_bytes(buffer[8..16].try_into().unwrap());
+        assert_eq!(low, desc.low());
+        assert_eq!(high, desc.high());
     }
 }

@@ -232,6 +232,51 @@ impl<V: MemoryAddr> TlbInvalidation<V> for NoFlush {
     }
 }
 
+/// CPU-local address-space installation and activation policy.
+///
+/// Page tables produce a root physical address; the activator owns the
+/// architecture- and CPU-local policy required to turn that root into a live
+/// hardware context. On x86_64 the token might include a CR3 frame, PCID, and
+/// no-flush policy. On aarch64 it might include TTBR state plus an ASID, and
+/// on RISC-V it might encode SATP mode, PPN, and ASID.
+///
+/// This trait is intentionally stateful. Kernels commonly allocate PCID/ASID
+/// tags per CPU and track the currently active address space without a global
+/// lock; requiring an activator object makes that synchronization boundary
+/// explicit at the callsite.
+pub trait AddrSpaceActivation: Sync + Send + 'static {
+    /// Opaque installed address-space handle understood by this activator.
+    type Token: Copy + Debug + Eq;
+
+    /// Validate and install a page-table root into this activator's local
+    /// bookkeeping, but do not make it active on the CPU.
+    fn install(&mut self, root: PhysAddr) -> PagingResult<Self::Token>;
+
+    /// Make a previously installed token active on the current CPU.
+    ///
+    /// # Safety
+    ///
+    /// The caller must ensure that switching to `token` is legal for the
+    /// current execution context: the target page table must map the code,
+    /// stack, and data needed to continue execution; required paging features
+    /// such as PCID, LA57, TTBR granule/width, or SATP mode must already be
+    /// enabled; and any architecture-specific interrupt/preemption constraints
+    /// must be upheld.
+    unsafe fn activate(&mut self, token: Self::Token) -> PagingResult;
+
+    /// Return the currently active token when the activator can observe it.
+    #[inline]
+    fn current(&self) -> PagingResult<Option<Self::Token>> {
+        Ok(None)
+    }
+
+    /// Release activator-local state for a previously installed token.
+    #[inline]
+    fn uninstall(&mut self, _token: Self::Token) -> PagingResult {
+        Ok(())
+    }
+}
+
 /// Frame-allocation contract used by the walker.
 pub trait FrameAllocator: Sync + Send + 'static {
     /// Allocate a zeroed contiguous physical range.
@@ -242,4 +287,64 @@ pub trait FrameAllocator: Sync + Send + 'static {
 
     /// HHDM-style translation: physical frame → kernel-visible virtual pointer.
     fn phys_to_virt(paddr: PhysAddr) -> VirtAddr;
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    struct MockToken {
+        root: PhysAddr,
+    }
+
+    #[derive(Default)]
+    struct MockActivation {
+        current: Option<MockToken>,
+        installed: usize,
+    }
+
+    impl AddrSpaceActivation for MockActivation {
+        type Token = MockToken;
+
+        fn install(&mut self, root: PhysAddr) -> PagingResult<Self::Token> {
+            self.installed += 1;
+            Ok(MockToken { root })
+        }
+
+        unsafe fn activate(&mut self, token: Self::Token) -> PagingResult {
+            self.current = Some(token);
+            Ok(())
+        }
+
+        fn current(&self) -> PagingResult<Option<Self::Token>> {
+            Ok(self.current)
+        }
+
+        fn uninstall(&mut self, token: Self::Token) -> PagingResult {
+            if self.current == Some(token) {
+                self.current = None;
+            }
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn activation_trait_supports_stateful_install_activate_uninstall() {
+        let mut activation = MockActivation::default();
+        let root = PhysAddr::from(0x2000usize);
+
+        let token = activation.install(root).unwrap();
+        assert_eq!(token.root, root);
+        assert_eq!(activation.installed, 1);
+        assert_eq!(activation.current().unwrap(), None);
+
+        unsafe {
+            activation.activate(token).unwrap();
+        }
+        assert_eq!(activation.current().unwrap(), Some(token));
+
+        activation.uninstall(token).unwrap();
+        assert_eq!(activation.current().unwrap(), None);
+    }
 }

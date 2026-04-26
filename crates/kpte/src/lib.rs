@@ -7,7 +7,8 @@
 //!
 //! # Crate structure
 //!
-//! - Traits: [`PageTableEntry`], [`PagingMetaData`], [`FrameAllocator`]
+//! - Traits: [`PageTableEntry`], [`PagingMetaData`], [`FrameAllocator`],
+//!   [`AddrSpaceActivation`]
 //! - Flags: [`AccessFlags`], [`MemoryAttributes`] — shared access/attr model
 //! - Mapping surface: [`Mapping`], [`MapBacking`], [`MappingFlags`]
 //! - Walker: [`PageTableWalker`] with internal batching for whole-range maps
@@ -36,6 +37,7 @@ pub use error::{PagingError, PagingResult};
 pub use mapping::{IntoMapBacking, MapBacking, Mapping, MappingContiguity, MappingFlags};
 pub use meta::{AccessFlags, CachePolicy, Coherency, MemoryAttributes, PageSize, Shareability};
 pub use paging::{
-    FrameAllocator, NoFlush, PageTableEntry, PageTableEntryKind, PagingMetaData, TlbInvalidation,
+    AddrSpaceActivation, FrameAllocator, NoFlush, PageTableEntry, PageTableEntryKind,
+    PagingMetaData, TlbInvalidation,
 };
 pub use walker::{PageTable, PageTableWalker};

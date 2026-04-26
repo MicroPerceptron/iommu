@@ -1,5 +1,7 @@
 use memory_addr::{PhysAddr, VirtAddr};
 
+use x86_64::registers::model_specific::Msr;
+
 use crate::{
     AccessFlags, CachePolicy, MemoryAttributes, PageSize, PageTableEntry, PageTableEntryKind,
     PagingMetaData,
@@ -87,7 +89,7 @@ const fn pat_entry(index: u8, ty: u64) -> u64 {
 /// activating mappings that use [`CachePolicy::WriteCombine`].
 pub unsafe fn install_x86_pat() {
     unsafe {
-        x86_64::registers::model_specific::Msr::new(X86_PAT_MSR).write(X86_PAT_MSR_VALUE);
+        Msr::new(X86_PAT_MSR).write(X86_PAT_MSR_VALUE);
     }
 }
 

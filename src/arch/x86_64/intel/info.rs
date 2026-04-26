@@ -2,53 +2,17 @@
 
 use memory_addr::PhysAddr;
 
-use crate::{ControllerKind, IommuInfo, MmioAddrRange, TranslationStage};
+use crate::{ControllerKind, IoDomain, IommuInfo, MmioAddrRange, PageSize, TranslationStage};
 
 use super::{
     caps::{VtdCapability, VtdExtendedCapability},
     paging::VtdSecondLevelAddressWidth,
 };
 
-/// VT-d architectural domain identifier.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
-#[repr(transparent)]
-pub struct VtdDomainId(u16);
-
-impl VtdDomainId {
-    /// Conventional non-zero domain id for simple second-level setups.
-    pub const DEFAULT: Self = Self(1);
-
-    #[inline]
-    pub const fn new(id: u16) -> Self {
-        Self(id)
-    }
-
-    #[inline]
-    pub const fn as_u16(self) -> u16 {
-        self.0
-    }
-}
-
-impl Default for VtdDomainId {
-    #[inline]
-    fn default() -> Self {
-        Self::DEFAULT
-    }
-}
-
-impl From<u16> for VtdDomainId {
-    #[inline]
-    fn from(value: u16) -> Self {
-        Self::new(value)
-    }
-}
-
-impl From<VtdDomainId> for u16 {
-    #[inline]
-    fn from(value: VtdDomainId) -> Self {
-        value.as_u16()
-    }
-}
+pub const VTD_DOMAIN_MASK: u32 = 0x0000_ffff;
+pub type VtdIoDomain = IoDomain<VTD_DOMAIN_MASK>;
+/// Conventional non-zero domain id for simple second-level setups.
+pub const VTD_DEFAULT_DOMAIN: VtdIoDomain = VtdIoDomain::from_parts_trusted(1, 0);
 
 /// VT-d version register split into major/minor nibbles.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
@@ -80,7 +44,7 @@ impl VtdVersion {
 /// One concrete VT-d translation domain.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct VtdDomain {
-    id: VtdDomainId,
+    id: VtdIoDomain,
     root: PhysAddr,
     width: VtdSecondLevelAddressWidth,
     stage: TranslationStage,
@@ -89,7 +53,7 @@ pub struct VtdDomain {
 impl VtdDomain {
     #[inline]
     pub const fn new(
-        id: VtdDomainId,
+        id: VtdIoDomain,
         root: PhysAddr,
         width: VtdSecondLevelAddressWidth,
         stage: TranslationStage,
@@ -103,7 +67,7 @@ impl VtdDomain {
     }
 
     #[inline]
-    pub const fn id(self) -> VtdDomainId {
+    pub const fn id(self) -> VtdIoDomain {
         self.id
     }
 
@@ -220,7 +184,7 @@ impl VtdInfo {
     }
 
     #[inline]
-    pub const fn supports_leaf_size(self, size: crate::PageSize) -> bool {
+    pub const fn supports_leaf_size(self, size: PageSize) -> bool {
         self.cap.supports_leaf_size(size)
     }
 }
@@ -234,5 +198,14 @@ mod tests {
         let version = VtdVersion::from_bits(0x23);
         assert_eq!(version.major(), 2);
         assert_eq!(version.minor(), 3);
+    }
+
+    #[test]
+    fn vtd_domain_is_the_common_domain_value() {
+        let domain = VtdIoDomain::new(0x1234, 7).unwrap();
+
+        assert_eq!(domain.id(), 0x1234);
+        assert_eq!(domain.generation(), 7);
+        assert_eq!(VTD_DEFAULT_DOMAIN.id(), 1);
     }
 }

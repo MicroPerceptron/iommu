@@ -21,9 +21,11 @@
 //! `WriteThrough` has no direct Svpbmt representation and is clamped to the
 //! default/PMA policy.
 
+mod activation;
 mod entry;
 mod tlb;
 
+pub use activation::{Rv64SatpActivation, Rv64SatpControls, Rv64SatpToken};
 pub use entry::{
     RV64_PBMT_IO, RV64_PBMT_MASK, RV64_PBMT_NC, RV64_PBMT_PMA, Rv64Flags, Rv64Meta39, Rv64Meta48,
     Rv64Meta57, Rv64Pte, Rv64SvpbmtPte,

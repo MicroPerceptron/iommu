@@ -179,7 +179,10 @@ pub trait MmioRange<T: Unsigned>: Sized {
     fn from_start_size(start: MmioAddr<T>, size: usize) -> Option<Self>;
     fn from_phys_range(range: PhysAddrRange) -> Self;
     fn from_phys_start_size(start: PhysAddr, size: usize) -> Option<Self>;
-    fn as_phys_range(self) -> PhysAddrRange;
+    fn to_phys_range(self) -> PhysAddrRange;
+    fn as_phys_range(self) -> PhysAddrRange {
+        self.to_phys_range()
+    }
     fn reg<const W: usize>(self, offset: usize) -> Option<MmioAddr<T>>;
     fn reg8(self, offset: usize) -> Option<MmioAddr<T>>;
     fn reg16(self, offset: usize) -> Option<MmioAddr<T>>;
@@ -210,7 +213,7 @@ impl<T: Unsigned> MmioRange<T> for MmioAddrRange<T> {
     }
 
     #[inline]
-    fn as_phys_range(self) -> PhysAddrRange {
+    fn to_phys_range(self) -> PhysAddrRange {
         PhysAddrRange {
             start: self.start.as_phys(),
             end: self.end.as_phys(),
@@ -494,6 +497,10 @@ mod tests {
         assert_eq!(mmio_value(range.reg32(0x20).unwrap()), 0x1020);
         assert_eq!(mmio_value(range.reg64(0x38).unwrap()), 0x1038);
         assert!(range.reg64(0x39).is_none());
+        assert_eq!(
+            range.to_phys_range(),
+            PhysAddrRange::from_start_size(PhysAddr::from_usize(0x1000), 0x40)
+        );
 
         assert_eq!(mmio_value(range.reg32_aligned(0x20).unwrap()), 0x1020);
         assert!(range.reg32_aligned(0x22).is_none());

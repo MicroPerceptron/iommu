@@ -34,8 +34,9 @@ use heapless::Vec;
 use memory_addr::{AddrRange, MemoryAddr, PhysAddr, PhysAddrRange};
 
 use crate::{
-    FrameAllocator, IntoMapBacking, MapBacking, Mapping, MappingContiguity, MappingFlags, PageSize,
-    PageTableEntry, PageTableEntryKind, PagingError, PagingMetaData, PagingResult, TlbInvalidation,
+    AddrSpaceActivation, FrameAllocator, IntoMapBacking, MapBacking, Mapping, MappingContiguity,
+    MappingFlags, PageSize, PageTableEntry, PageTableEntryKind, PagingError, PagingMetaData,
+    PagingResult, TlbInvalidation,
 };
 
 /// Maximum stack depth for the walker's parent-tracking. Sized to cover
@@ -55,6 +56,17 @@ pub trait PageTable<V: MemoryAddr> {
     type Entry: PageTableEntry;
 
     fn root(&self) -> PhysAddr;
+
+    /// Install this page table into an architecture-specific activation
+    /// policy. The returned token can later be made active through
+    /// [`AddrSpaceActivation::activate`].
+    #[inline]
+    fn install_with<A>(&self, activation: &mut A) -> PagingResult<A::Token>
+    where
+        A: AddrSpaceActivation,
+    {
+        activation.install(self.root())
+    }
 
     fn query(&self, vaddr: V) -> PagingResult<Mapping<Self::Entry, V>>;
 
