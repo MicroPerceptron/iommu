@@ -1,7 +1,7 @@
 use super::*;
 use kpte::arch::{ARCH_NAME, Flags4K48, PageTable4K48, Pte4K48};
 
-type BenchPt4K48 = PageTable4K48<BenchAlloc, NoFlush>;
+type BenchPt4K48 = PageTable4K48<BenchAlloc>;
 
 pub(super) fn run() {
     println!();
@@ -27,7 +27,7 @@ pub(super) fn run() {
 }
 
 fn bench_range_map_sequential() {
-    let mut pt = BenchPt4K48::try_new(NoFlush).unwrap();
+    let mut pt = BenchPt4K48::try_new().unwrap();
     pt.map(
         VirtAddrRange::from_start_size(
             VirtAddr::from_usize(0x1000_0000),
@@ -38,17 +38,19 @@ fn bench_range_map_sequential() {
             Flags4K48::new(AccessFlags::READ | AccessFlags::WRITE),
             PageSize::Size4K,
         ),
+        &NoFlush,
     )
     .unwrap();
     black_box(pt.root());
 }
 
 fn setup_query_hot() -> BenchPt4K48 {
-    let mut pt = BenchPt4K48::try_new(NoFlush).unwrap();
+    let mut pt = BenchPt4K48::try_new().unwrap();
     pt.map(
         VirtAddrRange::from_start_size(VirtAddr::from_usize(0x2000_0000), QUERY_PAGES * PAGE_4K),
         PhysAddr::from_usize(0x6000_0000),
         MappingFlags::scattered(Flags4K48::new(AccessFlags::READ), PageSize::Size4K),
+        &NoFlush,
     )
     .unwrap();
     pt

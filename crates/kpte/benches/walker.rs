@@ -175,7 +175,7 @@ fn print_sample(
 }
 
 fn bench_range_map_sequential() {
-    let mut pt = RecordingPt::try_new(RecordingTlb::default()).unwrap();
+    let mut pt = RecordingPt::try_new().unwrap();
     pt.map(
         VirtAddrRange::from_start_size(
             VirtAddr::from_usize(0x1000_0000),
@@ -186,18 +186,20 @@ fn bench_range_map_sequential() {
             flags(AccessFlags::READ | AccessFlags::WRITE),
             PageSize::Size4K,
         ),
+        &RECORDING_TLB,
     )
     .unwrap();
     black_box(tlb_range_flushes());
 }
 
 fn bench_loop_map_sequential() {
-    let mut pt = RecordingPt::try_new(RecordingTlb::default()).unwrap();
+    let mut pt = RecordingPt::try_new().unwrap();
     for i in 0..SEQUENTIAL_PAGES {
         pt.map(
             vrange(0x1000_0000 + i * PAGE_4K, PageSize::Size4K),
             PhysAddr::from_usize(0x4000_0000 + i * PAGE_4K),
             flags(AccessFlags::READ | AccessFlags::WRITE),
+            &RECORDING_TLB,
         )
         .unwrap();
     }
@@ -205,7 +207,7 @@ fn bench_loop_map_sequential() {
 }
 
 fn bench_range_map_fragmented() {
-    let mut pt = RecordingPt::try_new(RecordingTlb::default()).unwrap();
+    let mut pt = RecordingPt::try_new().unwrap();
     let ranges: Vec<PhysAddrRange> = (0..FRAGMENTED_PAGES)
         .map(|i| {
             PhysAddrRange::from_start_size(PhysAddr::from_usize(0x4000_0000 + i * 0x2000), PAGE_4K)
@@ -218,17 +220,19 @@ fn bench_range_map_fragmented() {
         ),
         ranges.as_slice(),
         MappingFlags::scattered(flags(AccessFlags::READ), PageSize::Size4K),
+        &RECORDING_TLB,
     )
     .unwrap();
     black_box(tlb_range_flushes());
 }
 
 fn setup_query_hot() -> BenchPt {
-    let mut pt = BenchPt::try_new(NoFlush).unwrap();
+    let mut pt = BenchPt::try_new().unwrap();
     pt.map(
         VirtAddrRange::from_start_size(VirtAddr::from_usize(0x2000_0000), QUERY_PAGES * PAGE_4K),
         PhysAddr::from_usize(0x6000_0000),
         MappingFlags::scattered(flags(AccessFlags::READ), PageSize::Size4K),
+        &NO_FLUSH,
     )
     .unwrap();
     pt
@@ -247,11 +251,12 @@ fn run_query_hot(pt: &mut BenchPt) {
 }
 
 fn setup_protect_sequential() -> RecordingPt {
-    let mut pt = RecordingPt::try_new(RecordingTlb::default()).unwrap();
+    let mut pt = RecordingPt::try_new().unwrap();
     pt.map(
         VirtAddrRange::from_start_size(VirtAddr::from_usize(0x3000_0000), PROTECT_ITERS * PAGE_4K),
         PhysAddr::from_usize(0x7000_0000),
         MappingFlags::scattered(flags(AccessFlags::READ), PageSize::Size4K),
+        &RECORDING_TLB,
     )
     .unwrap();
     pt
@@ -263,6 +268,7 @@ fn run_protect_sequential(pt: &mut RecordingPt) {
         pt.protect(
             vrange(0x3000_0000 + i * PAGE_4K, PageSize::Size4K),
             flags(AccessFlags::READ | AccessFlags::WRITE),
+            &RECORDING_TLB,
         )
         .unwrap();
     }
@@ -270,39 +276,44 @@ fn run_protect_sequential(pt: &mut RecordingPt) {
 }
 
 fn setup_split_2m() -> (BenchPt, VirtAddrRange) {
-    let mut pt = BenchPt::try_new(NoFlush).unwrap();
+    let mut pt = BenchPt::try_new().unwrap();
     let range = vrange(0x4000_0000, PageSize::Size2M);
     pt.map(
         range,
         PhysAddr::from_usize(0x8000_0000),
         flags(AccessFlags::READ),
+        &NO_FLUSH,
     )
     .unwrap();
     (pt, range)
 }
 
 fn run_split_2m((pt, range): &mut (BenchPt, VirtAddrRange)) {
-    black_box(pt.split_at(*range).unwrap());
+    black_box(pt.split_at(*range, &NO_FLUSH).unwrap());
 }
 
 fn setup_merge_2m() -> (BenchPt, VirtAddrRange) {
-    let mut pt = BenchPt::try_new(NoFlush).unwrap();
+    let mut pt = BenchPt::try_new().unwrap();
     let range = vrange(0x4000_0000, PageSize::Size2M);
     pt.map(
         range,
         PhysAddr::from_usize(0x8000_0000),
         MappingFlags::scattered(flags(AccessFlags::READ), PageSize::Size4K),
+        &NO_FLUSH,
     )
     .unwrap();
     (pt, range)
 }
 
 fn run_merge_2m((pt, range): &mut (BenchPt, VirtAddrRange)) {
-    black_box(pt.merge_at(*range).unwrap());
+    black_box(pt.merge_at(*range, &NO_FLUSH).unwrap());
 }
 
-type BenchPt = PageTable<BenchMeta, BenchPte, BenchAlloc, NoFlush>;
-type RecordingPt = PageTable<BenchMeta, BenchPte, BenchAlloc, RecordingTlb>;
+type BenchPt = PageTable<BenchMeta, BenchPte, BenchAlloc>;
+type RecordingPt = PageTable<BenchMeta, BenchPte, BenchAlloc>;
+
+const NO_FLUSH: NoFlush = NoFlush;
+const RECORDING_TLB: RecordingTlb = RecordingTlb;
 
 fn vrange(start: usize, size: PageSize) -> VirtAddrRange {
     VirtAddrRange::from_start_size(VirtAddr::from_usize(start), size.bytes())

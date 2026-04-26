@@ -31,22 +31,19 @@ pub use entry::{
 pub use tlb::Rv64Tlb;
 
 /// RISC-V Sv39 page table.
-pub type Rv64PageTable39<Alloc, Tlb> = crate::PageTable<Rv64Meta39, Rv64Pte, Alloc, Tlb>;
+pub type Rv64PageTable39<Alloc> = crate::PageTable<Rv64Meta39, Rv64Pte, Alloc>;
 
 /// RISC-V Sv48 page table.
-pub type Rv64PageTable48<Alloc, Tlb> = crate::PageTable<Rv64Meta48, Rv64Pte, Alloc, Tlb>;
+pub type Rv64PageTable48<Alloc> = crate::PageTable<Rv64Meta48, Rv64Pte, Alloc>;
 
 /// RISC-V Sv57 page table.
-pub type Rv64PageTable57<Alloc, Tlb> = crate::PageTable<Rv64Meta57, Rv64Pte, Alloc, Tlb>;
+pub type Rv64PageTable57<Alloc> = crate::PageTable<Rv64Meta57, Rv64Pte, Alloc>;
 
 /// RISC-V Sv39 page table with Svpbmt memory-type bits enabled.
-pub type Rv64SvpbmtPageTable39<Alloc, Tlb> =
-    crate::PageTable<Rv64Meta39, Rv64SvpbmtPte, Alloc, Tlb>;
+pub type Rv64SvpbmtPageTable39<Alloc> = crate::PageTable<Rv64Meta39, Rv64SvpbmtPte, Alloc>;
 
 /// RISC-V Sv48 page table with Svpbmt memory-type bits enabled.
-pub type Rv64SvpbmtPageTable48<Alloc, Tlb> =
-    crate::PageTable<Rv64Meta48, Rv64SvpbmtPte, Alloc, Tlb>;
+pub type Rv64SvpbmtPageTable48<Alloc> = crate::PageTable<Rv64Meta48, Rv64SvpbmtPte, Alloc>;
 
 /// RISC-V Sv57 page table with Svpbmt memory-type bits enabled.
-pub type Rv64SvpbmtPageTable57<Alloc, Tlb> =
-    crate::PageTable<Rv64Meta57, Rv64SvpbmtPte, Alloc, Tlb>;
+pub type Rv64SvpbmtPageTable57<Alloc> = crate::PageTable<Rv64Meta57, Rv64SvpbmtPte, Alloc>;

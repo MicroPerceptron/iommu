@@ -41,16 +41,13 @@ define_rv_iommu_meta!(RvIommuMeta39, 3, 39);
 define_rv_iommu_meta!(RvIommuMeta48, 4, 48);
 define_rv_iommu_meta!(RvIommuMeta57, 5, 57);
 
-pub type RvIommuPageTable39<Alloc, Tlb> = PageTable<RvIommuMeta39, RvIommuPte, Alloc, Tlb>;
-pub type RvIommuPageTable48<Alloc, Tlb> = PageTable<RvIommuMeta48, RvIommuPte, Alloc, Tlb>;
-pub type RvIommuPageTable57<Alloc, Tlb> = PageTable<RvIommuMeta57, RvIommuPte, Alloc, Tlb>;
+pub type RvIommuPageTable39<Alloc> = PageTable<RvIommuMeta39, RvIommuPte, Alloc>;
+pub type RvIommuPageTable48<Alloc> = PageTable<RvIommuMeta48, RvIommuPte, Alloc>;
+pub type RvIommuPageTable57<Alloc> = PageTable<RvIommuMeta57, RvIommuPte, Alloc>;
 
-pub type RvIommuSvpbmtPageTable39<Alloc, Tlb> =
-    PageTable<RvIommuMeta39, RvIommuSvpbmtPte, Alloc, Tlb>;
-pub type RvIommuSvpbmtPageTable48<Alloc, Tlb> =
-    PageTable<RvIommuMeta48, RvIommuSvpbmtPte, Alloc, Tlb>;
-pub type RvIommuSvpbmtPageTable57<Alloc, Tlb> =
-    PageTable<RvIommuMeta57, RvIommuSvpbmtPte, Alloc, Tlb>;
+pub type RvIommuSvpbmtPageTable39<Alloc> = PageTable<RvIommuMeta39, RvIommuSvpbmtPte, Alloc>;
+pub type RvIommuSvpbmtPageTable48<Alloc> = PageTable<RvIommuMeta48, RvIommuSvpbmtPte, Alloc>;
+pub type RvIommuSvpbmtPageTable57<Alloc> = PageTable<RvIommuMeta57, RvIommuSvpbmtPte, Alloc>;
 
 #[cfg(test)]
 mod tests {

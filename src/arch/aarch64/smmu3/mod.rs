@@ -124,18 +124,12 @@ define_smmu_vmsa_meta_16k!(SmmuVmsaMeta16K52, 52, 52, 5);
 define_smmu_vmsa_meta_64k!(SmmuVmsaMeta64K48, 48, 48, 6);
 define_smmu_vmsa_meta_64k!(SmmuVmsaMeta64K52, 52, 52, 10);
 
-pub type SmmuVmsaPageTable4K48<Alloc, Tlb> =
-    PageTable<SmmuVmsaMeta4K48, SmmuVmsaPte4K48, Alloc, Tlb>;
-pub type SmmuVmsaPageTable4K52<Alloc, Tlb> =
-    PageTable<SmmuVmsaMeta4K52, SmmuVmsaPte4K52, Alloc, Tlb>;
-pub type SmmuVmsaPageTable16K48<Alloc, Tlb> =
-    PageTable<SmmuVmsaMeta16K48, SmmuVmsaPte16K48, Alloc, Tlb>;
-pub type SmmuVmsaPageTable16K52<Alloc, Tlb> =
-    PageTable<SmmuVmsaMeta16K52, SmmuVmsaPte16K52, Alloc, Tlb>;
-pub type SmmuVmsaPageTable64K48<Alloc, Tlb> =
-    PageTable<SmmuVmsaMeta64K48, SmmuVmsaPte64K48, Alloc, Tlb>;
-pub type SmmuVmsaPageTable64K52<Alloc, Tlb> =
-    PageTable<SmmuVmsaMeta64K52, SmmuVmsaPte64K52, Alloc, Tlb>;
+pub type SmmuVmsaPageTable4K48<Alloc> = PageTable<SmmuVmsaMeta4K48, SmmuVmsaPte4K48, Alloc>;
+pub type SmmuVmsaPageTable4K52<Alloc> = PageTable<SmmuVmsaMeta4K52, SmmuVmsaPte4K52, Alloc>;
+pub type SmmuVmsaPageTable16K48<Alloc> = PageTable<SmmuVmsaMeta16K48, SmmuVmsaPte16K48, Alloc>;
+pub type SmmuVmsaPageTable16K52<Alloc> = PageTable<SmmuVmsaMeta16K52, SmmuVmsaPte16K52, Alloc>;
+pub type SmmuVmsaPageTable64K48<Alloc> = PageTable<SmmuVmsaMeta64K48, SmmuVmsaPte64K48, Alloc>;
+pub type SmmuVmsaPageTable64K52<Alloc> = PageTable<SmmuVmsaMeta64K52, SmmuVmsaPte64K52, Alloc>;
 
 #[cfg(test)]
 mod tests {

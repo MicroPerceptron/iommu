@@ -38,19 +38,19 @@ pub use entry::{
 pub use tlb::A64Tlb;
 
 /// AArch64 4 KiB granule page table with 48-bit VA/OA.
-pub type A64PageTable4K48<Alloc, Tlb> = crate::PageTable<A64Meta4K48, A64Pte4K48, Alloc, Tlb>;
+pub type A64PageTable4K48<Alloc> = crate::PageTable<A64Meta4K48, A64Pte4K48, Alloc>;
 
 /// AArch64 4 KiB granule page table with 52-bit VA/OA.
-pub type A64PageTable4K52<Alloc, Tlb> = crate::PageTable<A64Meta4K52, A64Pte4K52, Alloc, Tlb>;
+pub type A64PageTable4K52<Alloc> = crate::PageTable<A64Meta4K52, A64Pte4K52, Alloc>;
 
 /// AArch64 16 KiB granule page table with 48-bit VA/OA.
-pub type A64PageTable16K48<Alloc, Tlb> = crate::PageTable<A64Meta16K48, A64Pte16K48, Alloc, Tlb>;
+pub type A64PageTable16K48<Alloc> = crate::PageTable<A64Meta16K48, A64Pte16K48, Alloc>;
 
 /// AArch64 16 KiB granule page table with 52-bit VA/OA.
-pub type A64PageTable16K52<Alloc, Tlb> = crate::PageTable<A64Meta16K52, A64Pte16K52, Alloc, Tlb>;
+pub type A64PageTable16K52<Alloc> = crate::PageTable<A64Meta16K52, A64Pte16K52, Alloc>;
 
 /// AArch64 64 KiB granule page table with 48-bit VA/OA.
-pub type A64PageTable64K48<Alloc, Tlb> = crate::PageTable<A64Meta64K48, A64Pte64K48, Alloc, Tlb>;
+pub type A64PageTable64K48<Alloc> = crate::PageTable<A64Meta64K48, A64Pte64K48, Alloc>;
 
 /// AArch64 64 KiB granule page table with 52-bit VA/OA.
-pub type A64PageTable64K52<Alloc, Tlb> = crate::PageTable<A64Meta64K52, A64Pte64K52, Alloc, Tlb>;
+pub type A64PageTable64K52<Alloc> = crate::PageTable<A64Meta64K52, A64Pte64K52, Alloc>;

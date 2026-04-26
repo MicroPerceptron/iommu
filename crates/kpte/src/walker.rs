@@ -48,19 +48,13 @@ const MAX_LEVELS: usize = 6;
 /// Consumers parameterize over per-arch [`PagingMetaData`], per-arch or
 /// per-vendor [`PageTableEntry`], and a static [`FrameAllocator`] that
 /// supplies + reclaims intermediate-table frames.
-pub struct PageTable<Meta, Entry, Alloc, Tlb>
+pub struct PageTable<Meta, Entry, Alloc>
 where
     Meta: PagingMetaData,
     Entry: PageTableEntry,
     Alloc: FrameAllocator,
-    Tlb: TlbInvalidation<Meta::VirtAddr>,
 {
     root: PhysAddr,
-    /// Per-table TLB context. Stateless impls (`X86Tlb`, `NoFlush`) are
-    /// ZST and add no overhead; stateful impls (`X86PcidTlb`) own the
-    /// per-context tag (PCID/ASID/etc.) and release it via their own
-    /// `Drop` after the walker's tree teardown completes.
-    tlb: Tlb,
     _p: PhantomData<(Meta, Entry, Alloc)>,
 }
 
@@ -68,54 +62,57 @@ where
 // memory is reached only through `Alloc::phys_to_virt` which returns a
 // VirtAddr the consumer guarantees to be valid for the lifetime of the
 // PageTable. No interior mutability is shared across the boundary.
-unsafe impl<Meta, Entry, Alloc, Tlb> Send for PageTable<Meta, Entry, Alloc, Tlb>
+unsafe impl<Meta, Entry, Alloc> Send for PageTable<Meta, Entry, Alloc>
 where
     Meta: PagingMetaData,
     Entry: PageTableEntry,
     Alloc: FrameAllocator,
-    Tlb: TlbInvalidation<Meta::VirtAddr>,
 {
 }
 
-unsafe impl<Meta, Entry, Alloc, Tlb> Sync for PageTable<Meta, Entry, Alloc, Tlb>
+unsafe impl<Meta, Entry, Alloc> Sync for PageTable<Meta, Entry, Alloc>
 where
     Meta: PagingMetaData,
     Entry: PageTableEntry,
     Alloc: FrameAllocator,
-    Tlb: TlbInvalidation<Meta::VirtAddr>,
 {
 }
 
-impl<Meta, Entry, Alloc, Tlb> PageTable<Meta, Entry, Alloc, Tlb>
+impl<Meta, Entry, Alloc> PageTable<Meta, Entry, Alloc>
 where
     Meta: PagingMetaData,
     Entry: PageTableEntry,
     Alloc: FrameAllocator,
-    Tlb: TlbInvalidation<Meta::VirtAddr>,
 {
     /// Allocate a fresh root frame and return a walker bound to it.
     /// The frame is zeroed — `Alloc::allocate()` must guarantee that
     /// per the trait contract.
     ///
-    /// `tlb` is the invalidation context for this table. For stateless
-    /// impls pass the unit value (`X86Tlb`, `NoFlush`); for PCID/ASID-
-    /// tagged impls pass the constructed instance (`X86PcidTlb::new(pcid)`).
-    pub fn try_new(tlb: Tlb) -> PagingResult<Self> {
+    pub fn try_new() -> PagingResult<Self> {
         assert_walker_layout::<Meta, Entry>();
         let root = alloc_table_frame::<Meta, Alloc>()?;
         Ok(Self {
             root,
-            tlb,
             _p: PhantomData,
         })
     }
 
-    /// Borrow the TLB context. Useful for consumers that need to issue
-    /// invalidations outside the walker's own mutation paths (e.g. for
-    /// non-PT memory that aliases into a now-changed mapping).
-    #[inline]
-    pub fn tlb(&self) -> &Tlb {
-        &self.tlb
+    /// Construct a walker over an *existing* root table the kernel
+    /// already owns — the bootloader-provided root, an address space
+    /// inherited at fork, etc. Unlike [`Self::try_new`] this does not
+    /// allocate; the caller asserts the root is a valid, zeroed-or-
+    /// populated `Meta`-shaped table and that the underlying frames
+    /// will not be released while this walker holds them.
+    ///
+    /// The walker takes over mapping/unmapping the existing tree as if
+    /// it had built it. New internal nodes added by subsequent map
+    /// operations come from `Alloc`; existing nodes are left as-is.
+    pub fn adopt(root: PhysAddr) -> Self {
+        assert_walker_layout::<Meta, Entry>();
+        Self {
+            root,
+            _p: PhantomData,
+        }
     }
 
     /// Physical address of the root table — used by the consumer to
@@ -126,8 +123,14 @@ where
     }
 
     #[inline]
-    fn cursor(&mut self) -> PageTableCursor<'_, Meta, Entry, Alloc, Tlb> {
-        PageTableCursor::new(self)
+    fn cursor<'pt, Tlb>(
+        &'pt mut self,
+        tlb: &'pt Tlb,
+    ) -> PageTableCursor<'pt, Meta, Entry, Alloc, Tlb>
+    where
+        Tlb: TlbInvalidation<Meta::VirtAddr>,
+    {
+        PageTableCursor::new(self, tlb)
     }
 
     /// Look up the leaf mapping covering `vaddr`.
@@ -200,6 +203,7 @@ where
         range: AddrRange<Meta::VirtAddr>,
         backing: B,
         flags: F,
+        tlb: &impl TlbInvalidation<Meta::VirtAddr>,
     ) -> PagingResult
     where
         B: IntoMapBacking<'a>,
@@ -221,12 +225,12 @@ where
                     size,
                     target_level,
                 )?;
-                self.flush_leaf_range(range);
+                self.flush_leaf_range(range, tlb);
                 return Ok(());
             }
         }
 
-        let mut cursor = self.cursor();
+        let mut cursor = self.cursor(tlb);
         cursor.map(range, backing, flags)?;
         cursor.finish()
     }
@@ -283,9 +287,10 @@ where
         range: AddrRange<Meta::VirtAddr>,
         paddr: PhysAddr,
         flags: Entry::Flags,
+        tlb: &impl TlbInvalidation<Meta::VirtAddr>,
     ) -> PagingResult<Mapping<Entry, Meta::VirtAddr>> {
         let mapping = self.remap_no_flush(range, paddr, flags)?;
-        self.flush_leaf_range(mapping.range);
+        self.flush_leaf_range(mapping.range, tlb);
         Ok(mapping)
     }
 
@@ -312,9 +317,10 @@ where
         &mut self,
         range: AddrRange<Meta::VirtAddr>,
         flags: Entry::Flags,
+        tlb: &impl TlbInvalidation<Meta::VirtAddr>,
     ) -> PagingResult<Mapping<Entry, Meta::VirtAddr>> {
         let mapping = self.protect_no_flush(range, flags)?;
-        self.flush_leaf_range(mapping.range);
+        self.flush_leaf_range(mapping.range, tlb);
         Ok(mapping)
     }
 
@@ -338,9 +344,10 @@ where
     pub fn unmap(
         &mut self,
         range: AddrRange<Meta::VirtAddr>,
+        tlb: &impl TlbInvalidation<Meta::VirtAddr>,
     ) -> PagingResult<Mapping<Entry, Meta::VirtAddr>> {
         let result = self.unmap_no_flush(range)?;
-        self.flush_leaf_range(result.range);
+        self.flush_leaf_range(result.range, tlb);
         Ok(result)
     }
 
@@ -425,7 +432,11 @@ where
     /// Split the exact leaf at `range` into one table of entries one level
     /// finer. Returns the new leaf size. Errors if the entry is not
     /// present or already at the finest granularity.
-    pub fn split_at(&mut self, range: AddrRange<Meta::VirtAddr>) -> PagingResult<PageSize> {
+    pub fn split_at(
+        &mut self,
+        range: AddrRange<Meta::VirtAddr>,
+        tlb: &impl TlbInvalidation<Meta::VirtAddr>,
+    ) -> PagingResult<PageSize> {
         let vaddr = range.start;
         check_vaddr::<Meta>(vaddr)?;
 
@@ -476,7 +487,7 @@ where
                     write_entry::<Entry, Alloc>(current, idx, Entry::new_table(child, level));
                 }
 
-                self.flush_leaf_range(range);
+                self.flush_leaf_range(range, tlb);
 
                 return Ok(finer_size);
             }
@@ -506,7 +517,11 @@ where
     ///
     /// Any failure → [`PagingError::NotCoalescable`] with the tree
     /// unmodified.
-    pub fn merge_at(&mut self, range: AddrRange<Meta::VirtAddr>) -> PagingResult<PageSize> {
+    pub fn merge_at(
+        &mut self,
+        range: AddrRange<Meta::VirtAddr>,
+        tlb: &impl TlbInvalidation<Meta::VirtAddr>,
+    ) -> PagingResult<PageSize> {
         let target_size = check_leaf_range::<Meta>(range)?;
         let vaddr = range.start;
 
@@ -590,29 +605,31 @@ where
             );
         }
         dealloc_table_frame::<Meta, Alloc>(child_table_phys)?;
-        self.flush_leaf_range(range);
+        self.flush_leaf_range(range, tlb);
 
         Ok(target_size)
     }
 
     #[inline]
-    fn flush_leaf_range(&self, range: AddrRange<Meta::VirtAddr>) {
+    fn flush_leaf_range(
+        &self,
+        range: AddrRange<Meta::VirtAddr>,
+        tlb: &impl TlbInvalidation<Meta::VirtAddr>,
+    ) {
         let count_pages = range.size() / Meta::BASE_PAGE_SIZE.bytes();
-        if self.tlb.prefer_full_flush(count_pages) {
-            self.tlb.flush_tlb_all_local();
+        if tlb.prefer_full_flush(count_pages) {
+            tlb.flush_tlb_all_local();
         } else {
-            self.tlb
-                .flush_tlb_range_local(range.start, Meta::BASE_PAGE_SIZE, count_pages);
+            tlb.flush_tlb_range_local(range.start, Meta::BASE_PAGE_SIZE, count_pages);
         }
     }
 }
 
-impl<Meta, Entry, Alloc, Tlb> Drop for PageTable<Meta, Entry, Alloc, Tlb>
+impl<Meta, Entry, Alloc> Drop for PageTable<Meta, Entry, Alloc>
 where
     Meta: PagingMetaData,
     Entry: PageTableEntry,
     Alloc: FrameAllocator,
-    Tlb: TlbInvalidation<Meta::VirtAddr>,
 {
     /// Recursive subtree reclaim. Walks the entire tree depth-first
     /// and returns every intermediate + the root frame to the
@@ -697,7 +714,8 @@ where
     Alloc: FrameAllocator,
     Tlb: TlbInvalidation<Meta::VirtAddr>,
 {
-    pt: &'pt mut PageTable<Meta, Entry, Alloc, Tlb>,
+    pt: &'pt mut PageTable<Meta, Entry, Alloc>,
+    tlb: &'pt Tlb,
     /// Frames cached by the previous walk, indexed `[level - 1]`:
     ///   `descent[L - 1] = Some(frame_phys)` means we know the table at
     ///   level `L` for the previous vaddr's path.
@@ -720,13 +738,14 @@ where
     Alloc: FrameAllocator,
     Tlb: TlbInvalidation<Meta::VirtAddr>,
 {
-    fn new(pt: &'pt mut PageTable<Meta, Entry, Alloc, Tlb>) -> Self {
+    fn new(pt: &'pt mut PageTable<Meta, Entry, Alloc>, tlb: &'pt Tlb) -> Self {
         // Root is never stored in `descent` — the walker reads it
         // directly from `pt.root` on every walk start. Only levels
         // 1..LEVELS-1 (intermediate tables) get cached; the slot at
         // `descent[LEVELS - 1]` (which would be root) stays `None`.
         Self {
             pt,
+            tlb,
             descent: [None; MAX_LEVELS],
             last_vaddr: None,
             pending_flushes: Vec::new(),
@@ -830,7 +849,7 @@ where
             .iter()
             .fold(0usize, |acc, range| acc.saturating_add(range.pages));
         if self.needs_full_flush {
-            self.pt.tlb.flush_tlb_all_local();
+            self.tlb.flush_tlb_all_local();
             self.pending_flushes.clear();
             self.needs_full_flush = false;
             return;
@@ -838,15 +857,14 @@ where
         if count == 0 {
             return;
         }
-        let tlb = &self.pt.tlb;
-        if tlb.prefer_full_flush(count) {
-            tlb.flush_tlb_all_local();
+        if self.tlb.prefer_full_flush(count) {
+            self.tlb.flush_tlb_all_local();
         } else {
             self.pending_flushes
                 .sort_unstable_by_key(|range| range.start);
 
             for range in self.pending_flushes.iter().copied() {
-                tlb.flush_tlb_range_local(
+                self.tlb.flush_tlb_range_local(
                     Meta::VirtAddr::from(range.start),
                     Meta::BASE_PAGE_SIZE,
                     range.pages,
@@ -1647,7 +1665,7 @@ mod tests {
     // Walker tests use NoFlush — they exercise the tree mechanics, not
     // the TLB layer. CPU TLB invalidation is covered separately in the
     // `arch::x86_64::X86Tlb` impl tests.
-    type Pt = PageTable<MockMeta, MockPte, MockAlloc, NoFlush>;
+    type Pt = PageTable<MockMeta, MockPte, MockAlloc>;
 
     struct WideTableMeta;
 
@@ -1698,7 +1716,10 @@ mod tests {
         }
     }
 
-    type RecordingPt = PageTable<MockMeta, MockPte, MockAlloc, RecordingTlb>;
+    type RecordingPt = PageTable<MockMeta, MockPte, MockAlloc>;
+
+    const NO_FLUSH: NoFlush = NoFlush;
+    const RECORDING_TLB: RecordingTlb = RecordingTlb;
 
     fn flags(access: AccessFlags) -> MockFlags {
         MockFlags {
@@ -1737,21 +1758,21 @@ mod tests {
     #[test]
     fn map_query_unmap_4k_round_trip() {
         let _g = test_setup();
-        let mut pt = Pt::try_new(NoFlush).unwrap();
+        let mut pt = Pt::try_new().unwrap();
         let v = memory_addr::VirtAddr::from_usize(0x1000_0000);
         let p = PhysAddr::from_usize(0xdead_0000);
         let f = flags(AccessFlags::READ | AccessFlags::WRITE);
 
         let range = vrange(v.as_usize(), PageSize::Size4K);
 
-        pt.map(range, p, f).unwrap();
+        pt.map(range, p, f, &NO_FLUSH).unwrap();
         let mapping = pt.query(v).unwrap();
         assert_eq!(mapping.paddr.as_usize(), p.as_usize());
         assert_eq!(mapping.range, range);
         assert_eq!(mapping.size(), Some(PageSize::Size4K));
         assert!(mapping.flags.access.contains(AccessFlags::WRITE));
 
-        let unmapped = pt.unmap(range).unwrap();
+        let unmapped = pt.unmap(range, &NO_FLUSH).unwrap();
         assert_eq!(unmapped.paddr.as_usize(), p.as_usize());
         assert_eq!(unmapped.range, range);
         assert_eq!(unmapped.size(), Some(PageSize::Size4K));
@@ -1761,7 +1782,7 @@ mod tests {
     #[test]
     fn present_invalid_entry_fails_closed() {
         let _g = test_setup();
-        let pt = Pt::try_new(NoFlush).unwrap();
+        let pt = Pt::try_new().unwrap();
         unsafe {
             write_entry::<MockPte, MockAlloc>(pt.root, 0, MockPte(MOCK_PRESENT | MOCK_INVALID));
         }
@@ -1776,8 +1797,7 @@ mod tests {
     fn metadata_controls_table_frame_granule() {
         let _g = test_setup();
         {
-            let pt =
-                PageTable::<WideTableMeta, MockPte, MockAlloc, NoFlush>::try_new(NoFlush).unwrap();
+            let pt = PageTable::<WideTableMeta, MockPte, MockAlloc>::try_new().unwrap();
             assert!(PageSize::Size16K.is_aligned(pt.root().as_usize()));
             assert_eq!(LIVE_COUNT.load(Ordering::SeqCst), 1);
         }
@@ -1787,13 +1807,13 @@ mod tests {
     #[test]
     fn map_2m_huge_then_query() {
         let _g = test_setup();
-        let mut pt = Pt::try_new(NoFlush).unwrap();
+        let mut pt = Pt::try_new().unwrap();
         let v = memory_addr::VirtAddr::from_usize(0x4000_0000);
         let p = PhysAddr::from_usize(0x2_0000_0000);
         let f = flags(AccessFlags::READ);
 
         let range = vrange(v.as_usize(), PageSize::Size2M);
-        pt.map(range, p, f).unwrap();
+        pt.map(range, p, f, &NO_FLUSH).unwrap();
         let mapping = pt.query(v).unwrap();
         assert_eq!(mapping.range, range);
         assert_eq!(mapping.size(), Some(PageSize::Size2M));
@@ -1802,27 +1822,36 @@ mod tests {
     #[test]
     fn exact_range_ops_refuse_interior_subranges() {
         let _g = test_setup();
-        let mut pt = Pt::try_new(NoFlush).unwrap();
+        let mut pt = Pt::try_new().unwrap();
         let v = memory_addr::VirtAddr::from_usize(0x4000_0000);
         let p = PhysAddr::from_usize(0x2_0000_0000);
         let range = vrange(v.as_usize(), PageSize::Size2M);
         let interior = vrange(v.as_usize() + 0x1000, PageSize::Size4K);
 
-        pt.map(range, p, flags(AccessFlags::READ)).unwrap();
+        pt.map(range, p, flags(AccessFlags::READ), &NO_FLUSH)
+            .unwrap();
 
         assert!(matches!(
-            pt.protect(interior, flags(AccessFlags::READ | AccessFlags::WRITE)),
+            pt.protect(
+                interior,
+                flags(AccessFlags::READ | AccessFlags::WRITE),
+                &NO_FLUSH
+            ),
             Err(PagingError::NotMapped)
         ));
         assert!(matches!(
             pt.remap(
                 interior,
                 PhysAddr::from_usize(0x3_0000_0000),
-                flags(AccessFlags::READ)
+                flags(AccessFlags::READ),
+                &NO_FLUSH
             ),
             Err(PagingError::NotMapped)
         ));
-        assert!(matches!(pt.unmap(interior), Err(PagingError::NotMapped)));
+        assert!(matches!(
+            pt.unmap(interior, &NO_FLUSH),
+            Err(PagingError::NotMapped)
+        ));
 
         let mapping = pt.query(v).unwrap();
         assert_eq!(mapping.range, range);
@@ -1832,15 +1861,15 @@ mod tests {
     #[test]
     fn double_map_returns_already_mapped() {
         let _g = test_setup();
-        let mut pt = Pt::try_new(NoFlush).unwrap();
+        let mut pt = Pt::try_new().unwrap();
         let v = memory_addr::VirtAddr::from_usize(0x2000);
         let p = PhysAddr::from_usize(0x4000);
         let f = flags(AccessFlags::READ);
 
         let range = vrange(v.as_usize(), PageSize::Size4K);
-        pt.map(range, p, f).unwrap();
+        pt.map(range, p, f, &NO_FLUSH).unwrap();
         assert!(matches!(
-            pt.map(range, p, f),
+            pt.map(range, p, f, &NO_FLUSH),
             Err(PagingError::AlreadyMapped)
         ));
     }
@@ -1848,14 +1877,14 @@ mod tests {
     #[test]
     fn multiple_virtual_ranges_may_share_one_physical_frame() {
         let _g = test_setup();
-        let mut pt = Pt::try_new(NoFlush).unwrap();
+        let mut pt = Pt::try_new().unwrap();
         let p = PhysAddr::from_usize(0x9000_0000);
         let r1 = vrange(0x1000_0000, PageSize::Size4K);
         let r2 = vrange(0x2000_0000, PageSize::Size4K);
         let f = flags(AccessFlags::READ | AccessFlags::WRITE);
 
-        pt.map(r1, p, f).unwrap();
-        pt.map(r2, p, f).unwrap();
+        pt.map(r1, p, f, &NO_FLUSH).unwrap();
+        pt.map(r2, p, f, &NO_FLUSH).unwrap();
 
         assert_eq!(
             pt.query(memory_addr::VirtAddr::from_usize(0x1000_0000))
@@ -1870,7 +1899,7 @@ mod tests {
             p
         );
 
-        pt.unmap(r1).unwrap();
+        pt.unmap(r1, &NO_FLUSH).unwrap();
         assert!(matches!(
             pt.query(memory_addr::VirtAddr::from_usize(0x1000_0000)),
             Err(PagingError::NotMapped)
@@ -1887,7 +1916,7 @@ mod tests {
     fn unmap_reclaims_emptied_intermediates() {
         let _g = test_setup();
         let baseline = live_count(); // 0 before try_new
-        let mut pt = Pt::try_new(NoFlush).unwrap();
+        let mut pt = Pt::try_new().unwrap();
         // 1 root frame
         assert_eq!(live_count(), baseline + 1);
 
@@ -1896,12 +1925,12 @@ mod tests {
         let f = flags(AccessFlags::READ);
 
         let range = vrange(v.as_usize(), PageSize::Size4K);
-        pt.map(range, p, f).unwrap();
+        pt.map(range, p, f, &NO_FLUSH).unwrap();
         // Walker allocated 3 intermediate frames (PML4 was the root, +
         // PDPT, PD, PT) — total live should be 4.
         assert_eq!(live_count(), baseline + 4);
 
-        pt.unmap(range).unwrap();
+        pt.unmap(range, &NO_FLUSH).unwrap();
         // unmap reclaims the 3 emptied intermediates. Root remains.
         assert_eq!(live_count(), baseline + 1);
     }
@@ -1911,7 +1940,7 @@ mod tests {
         let _g = test_setup();
         let baseline = live_count();
         {
-            let mut pt = Pt::try_new(NoFlush).unwrap();
+            let mut pt = Pt::try_new().unwrap();
             // Map several pages spread across multiple PD/PT subtrees.
             for i in 0..5 {
                 let v = memory_addr::VirtAddr::from_usize(0x1000_0000 + i * 0x4000_0000);
@@ -1920,6 +1949,7 @@ mod tests {
                     vrange(v.as_usize(), PageSize::Size4K),
                     p,
                     flags(AccessFlags::READ),
+                    &NO_FLUSH,
                 )
                 .unwrap();
             }
@@ -1932,13 +1962,14 @@ mod tests {
     #[test]
     fn split_2m_into_4k_leaves() {
         let _g = test_setup();
-        let mut pt = Pt::try_new(NoFlush).unwrap();
+        let mut pt = Pt::try_new().unwrap();
         let v = memory_addr::VirtAddr::from_usize(0x4000_0000);
         let p = PhysAddr::from_usize(0x8000_0000);
 
         let range = vrange(v.as_usize(), PageSize::Size2M);
-        pt.map(range, p, flags(AccessFlags::READ)).unwrap();
-        let new_size = pt.split_at(range).unwrap();
+        pt.map(range, p, flags(AccessFlags::READ), &NO_FLUSH)
+            .unwrap();
+        let new_size = pt.split_at(range, &NO_FLUSH).unwrap();
         assert_eq!(new_size, PageSize::Size4K);
 
         // Each of the 512 4K children must resolve to the right paddr.
@@ -1953,15 +1984,16 @@ mod tests {
     #[test]
     fn merge_after_split_round_trips() {
         let _g = test_setup();
-        let mut pt = Pt::try_new(NoFlush).unwrap();
+        let mut pt = Pt::try_new().unwrap();
         let v = memory_addr::VirtAddr::from_usize(0x4000_0000);
         let p = PhysAddr::from_usize(0x8000_0000);
 
         let range = vrange(v.as_usize(), PageSize::Size2M);
-        pt.map(range, p, flags(AccessFlags::READ)).unwrap();
-        pt.split_at(range).unwrap();
+        pt.map(range, p, flags(AccessFlags::READ), &NO_FLUSH)
+            .unwrap();
+        pt.split_at(range, &NO_FLUSH).unwrap();
 
-        let merged = pt.merge_at(range).unwrap();
+        let merged = pt.merge_at(range, &NO_FLUSH).unwrap();
         assert_eq!(merged, PageSize::Size2M);
 
         let mapping = pt.query(v).unwrap();
@@ -1971,7 +2003,7 @@ mod tests {
     #[test]
     fn merge_refuses_when_not_contiguous() {
         let _g = test_setup();
-        let mut pt = Pt::try_new(NoFlush).unwrap();
+        let mut pt = Pt::try_new().unwrap();
         let v = memory_addr::VirtAddr::from_usize(0x4000_0000);
 
         // Map 512 4K pages but with a hole in the middle of the
@@ -1986,12 +2018,13 @@ mod tests {
                 vrange(qv.as_usize(), PageSize::Size4K),
                 qp,
                 flags(AccessFlags::READ),
+                &NO_FLUSH,
             )
             .unwrap();
         }
 
         assert!(matches!(
-            pt.merge_at(vrange(v.as_usize(), PageSize::Size2M)),
+            pt.merge_at(vrange(v.as_usize(), PageSize::Size2M), &NO_FLUSH),
             Err(PagingError::NotCoalescable)
         ));
     }
@@ -1999,7 +2032,7 @@ mod tests {
     #[test]
     fn merge_refuses_on_mismatched_flags() {
         let _g = test_setup();
-        let mut pt = Pt::try_new(NoFlush).unwrap();
+        let mut pt = Pt::try_new().unwrap();
         let v = memory_addr::VirtAddr::from_usize(0x4000_0000);
         let p_base = 0x8000_0000;
 
@@ -2012,12 +2045,12 @@ mod tests {
             } else {
                 flags(AccessFlags::READ)
             };
-            pt.map(vrange(qv.as_usize(), PageSize::Size4K), qp, f)
+            pt.map(vrange(qv.as_usize(), PageSize::Size4K), qp, f, &NO_FLUSH)
                 .unwrap();
         }
 
         assert!(matches!(
-            pt.merge_at(vrange(v.as_usize(), PageSize::Size2M)),
+            pt.merge_at(vrange(v.as_usize(), PageSize::Size2M), &NO_FLUSH),
             Err(PagingError::NotCoalescable)
         ));
     }
@@ -2025,14 +2058,19 @@ mod tests {
     #[test]
     fn protect_keeps_paddr_changes_flags() {
         let _g = test_setup();
-        let mut pt = Pt::try_new(NoFlush).unwrap();
+        let mut pt = Pt::try_new().unwrap();
         let v = memory_addr::VirtAddr::from_usize(0x1000);
         let p = PhysAddr::from_usize(0x2000);
         let range = vrange(v.as_usize(), PageSize::Size4K);
-        pt.map(range, p, flags(AccessFlags::READ)).unwrap();
+        pt.map(range, p, flags(AccessFlags::READ), &NO_FLUSH)
+            .unwrap();
 
         let _ = pt
-            .protect(range, flags(AccessFlags::READ | AccessFlags::WRITE))
+            .protect(
+                range,
+                flags(AccessFlags::READ | AccessFlags::WRITE),
+                &NO_FLUSH,
+            )
             .unwrap();
         let mapping = pt.query(v).unwrap();
         assert_eq!(mapping.paddr.as_usize(), p.as_usize());
@@ -2042,14 +2080,16 @@ mod tests {
     #[test]
     fn remap_changes_paddr() {
         let _g = test_setup();
-        let mut pt = Pt::try_new(NoFlush).unwrap();
+        let mut pt = Pt::try_new().unwrap();
         let v = memory_addr::VirtAddr::from_usize(0x1000);
         let p1 = PhysAddr::from_usize(0x2000);
         let p2 = PhysAddr::from_usize(0x5000);
         let range = vrange(v.as_usize(), PageSize::Size4K);
-        pt.map(range, p1, flags(AccessFlags::READ)).unwrap();
+        pt.map(range, p1, flags(AccessFlags::READ), &NO_FLUSH)
+            .unwrap();
 
-        pt.remap(range, p2, flags(AccessFlags::READ)).unwrap();
+        pt.remap(range, p2, flags(AccessFlags::READ), &NO_FLUSH)
+            .unwrap();
         let mapping = pt.query(v).unwrap();
         assert_eq!(mapping.paddr.as_usize(), p2.as_usize());
     }
@@ -2059,13 +2099,13 @@ mod tests {
     #[test]
     fn cursor_maps_contiguous_range_correctly() {
         let _g = test_setup();
-        let mut pt = Pt::try_new(NoFlush).unwrap();
+        let mut pt = Pt::try_new().unwrap();
         let base_v = 0x1000_0000usize;
         let base_p = 0x4000_0000usize;
         let count = 64;
 
         {
-            let mut c = pt.cursor();
+            let mut c = pt.cursor(&NO_FLUSH);
             for i in 0..count {
                 let v = memory_addr::VirtAddr::from_usize(base_v + i * 0x1000);
                 let p = PhysAddr::from_usize(base_p + i * 0x1000);
@@ -2091,11 +2131,11 @@ mod tests {
     #[test]
     fn cursor_maps_across_level2_boundary_correctly() {
         let _g = test_setup();
-        let mut pt = Pt::try_new(NoFlush).unwrap();
+        let mut pt = Pt::try_new().unwrap();
         let addrs = [0x1ff000usize, 0x200000usize, 0x201000usize];
 
         {
-            let mut c = pt.cursor();
+            let mut c = pt.cursor(&NO_FLUSH);
             for (i, v) in addrs.into_iter().enumerate() {
                 c.map(
                     vrange(v, PageSize::Size4K),
@@ -2120,9 +2160,9 @@ mod tests {
         // that goes out of scope without explicit `finish` still leaves
         // the table queryable (i.e., didn't deadlock on pending flush).
         let _g = test_setup();
-        let mut pt = Pt::try_new(NoFlush).unwrap();
+        let mut pt = Pt::try_new().unwrap();
         {
-            let mut c = pt.cursor();
+            let mut c = pt.cursor(&NO_FLUSH);
             c.map(
                 vrange(0x1000, PageSize::Size4K),
                 PhysAddr::from_usize(0x2000),
@@ -2138,12 +2178,12 @@ mod tests {
     #[test]
     fn cursor_flushes_contiguous_pending_pages_as_range() {
         let _g = test_setup();
-        let mut pt = RecordingPt::try_new(RecordingTlb).unwrap();
+        let mut pt = RecordingPt::try_new().unwrap();
         let base_v = 0x5000_0000usize;
         let count = FLUSH_RANGE_CAP + 5;
 
         {
-            let mut c = pt.cursor();
+            let mut c = pt.cursor(&RECORDING_TLB);
             for i in 0..count {
                 c.map(
                     vrange(base_v + i * 0x1000, PageSize::Size4K),
@@ -2168,13 +2208,13 @@ mod tests {
         // highly fragmented batch that exceeds the range queue still
         // falls back to full flush while leaving all mappings installed.
         let _g = test_setup();
-        let mut pt = RecordingPt::try_new(RecordingTlb).unwrap();
+        let mut pt = RecordingPt::try_new().unwrap();
         let base_v = 0x4000_0000usize;
         let base_p = 0x8000_0000usize;
         let count = FLUSH_RANGE_CAP + 1;
 
         {
-            let mut c = pt.cursor();
+            let mut c = pt.cursor(&RECORDING_TLB);
             for i in 0..count {
                 c.map(
                     vrange(base_v + i * 0x2000, PageSize::Size4K),
@@ -2201,15 +2241,16 @@ mod tests {
     #[test]
     fn cursor_unmap_then_remap_roundtrip() {
         let _g = test_setup();
-        let mut pt = Pt::try_new(NoFlush).unwrap();
+        let mut pt = Pt::try_new().unwrap();
         let v = memory_addr::VirtAddr::from_usize(0x1000_0000);
         let p1 = PhysAddr::from_usize(0x4000_0000);
         let p2 = PhysAddr::from_usize(0x8000_0000);
         let range = vrange(v.as_usize(), PageSize::Size4K);
-        pt.map(range, p1, flags(AccessFlags::READ)).unwrap();
+        pt.map(range, p1, flags(AccessFlags::READ), &NO_FLUSH)
+            .unwrap();
 
         {
-            let mut c = pt.cursor();
+            let mut c = pt.cursor(&NO_FLUSH);
             c.unmap(range).unwrap();
             c.map(range, p2, flags(AccessFlags::READ | AccessFlags::WRITE))
                 .unwrap();
@@ -2223,7 +2264,7 @@ mod tests {
     #[test]
     fn map_scattered_backing_accepts_array_reference() {
         let _g = test_setup();
-        let mut pt = Pt::try_new(NoFlush).unwrap();
+        let mut pt = Pt::try_new().unwrap();
         let ranges: [PhysAddrRange; 16] = core::array::from_fn(|i| {
             PhysAddrRange::from_start_size(PhysAddr::from_usize(0x6000_0000 + i * 0x2000), 0x1000)
         });
@@ -2231,6 +2272,7 @@ mod tests {
             vrange(0x2000_0000, PageSize::Size64K),
             &ranges,
             MappingFlags::scattered(flags(AccessFlags::READ), PageSize::Size4K),
+            &NO_FLUSH,
         )
         .unwrap();
 
@@ -2245,7 +2287,7 @@ mod tests {
     #[test]
     fn map_scattered_backing_accepts_heapless_vec() {
         let _g = test_setup();
-        let mut pt = Pt::try_new(NoFlush).unwrap();
+        let mut pt = Pt::try_new().unwrap();
         let mut ranges = heapless::Vec::<PhysAddrRange, 4>::new();
         for i in 0..4 {
             ranges
@@ -2261,6 +2303,7 @@ mod tests {
             &ranges,
             MappingFlags::new(flags(AccessFlags::READ))
                 .with_contiguity(MappingContiguity::Scattered(PageSize::Size4K)),
+            &NO_FLUSH,
         )
         .unwrap();
 
@@ -2277,17 +2320,18 @@ mod tests {
         // should fail and invalidate the cursor cache. A subsequent
         // call must walk fresh and succeed at a different address.
         let _g = test_setup();
-        let mut pt = Pt::try_new(NoFlush).unwrap();
+        let mut pt = Pt::try_new().unwrap();
         let v1 = memory_addr::VirtAddr::from_usize(0x1000);
         let v2 = memory_addr::VirtAddr::from_usize(0x4000_0000);
         let r1 = vrange(v1.as_usize(), PageSize::Size4K);
         let r2 = vrange(v2.as_usize(), PageSize::Size4K);
         let f = flags(AccessFlags::READ);
 
-        pt.map(r1, PhysAddr::from_usize(0x2000), f).unwrap();
+        pt.map(r1, PhysAddr::from_usize(0x2000), f, &NO_FLUSH)
+            .unwrap();
 
         {
-            let mut c = pt.cursor();
+            let mut c = pt.cursor(&NO_FLUSH);
             // Attempting to remap v1 via cursor.map (a fresh map) fails.
             assert!(matches!(
                 c.map(r1, PhysAddr::from_usize(0x2000), f),

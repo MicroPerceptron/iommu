@@ -178,12 +178,12 @@ define_vtd_meta!(VtdSecondLevelMeta39, 3, 39);
 define_vtd_meta!(VtdSecondLevelMeta48, 4, 48);
 define_vtd_meta!(VtdSecondLevelMeta57, 5, 57);
 
-pub type VtdSecondLevelPageTable39<Alloc, Tlb> =
-    PageTable<VtdSecondLevelMeta39, VtdSecondLevelPte, Alloc, Tlb>;
-pub type VtdSecondLevelPageTable48<Alloc, Tlb> =
-    PageTable<VtdSecondLevelMeta48, VtdSecondLevelPte, Alloc, Tlb>;
-pub type VtdSecondLevelPageTable57<Alloc, Tlb> =
-    PageTable<VtdSecondLevelMeta57, VtdSecondLevelPte, Alloc, Tlb>;
+pub type VtdSecondLevelPageTable39<Alloc> =
+    PageTable<VtdSecondLevelMeta39, VtdSecondLevelPte, Alloc>;
+pub type VtdSecondLevelPageTable48<Alloc> =
+    PageTable<VtdSecondLevelMeta48, VtdSecondLevelPte, Alloc>;
+pub type VtdSecondLevelPageTable57<Alloc> =
+    PageTable<VtdSecondLevelMeta57, VtdSecondLevelPte, Alloc>;
 
 #[cfg(test)]
 mod tests {

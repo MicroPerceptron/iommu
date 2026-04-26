@@ -203,9 +203,9 @@ define_amd_vi_meta!(AmdViMeta39, 3, 39);
 define_amd_vi_meta!(AmdViMeta48, 4, 48);
 define_amd_vi_meta!(AmdViMeta57, 5, 57);
 
-pub type AmdViPageTable39<Alloc, Tlb> = PageTable<AmdViMeta39, AmdViPte, Alloc, Tlb>;
-pub type AmdViPageTable48<Alloc, Tlb> = PageTable<AmdViMeta48, AmdViPte, Alloc, Tlb>;
-pub type AmdViPageTable57<Alloc, Tlb> = PageTable<AmdViMeta57, AmdViPte, Alloc, Tlb>;
+pub type AmdViPageTable39<Alloc> = PageTable<AmdViMeta39, AmdViPte, Alloc>;
+pub type AmdViPageTable48<Alloc> = PageTable<AmdViMeta48, AmdViPte, Alloc>;
+pub type AmdViPageTable57<Alloc> = PageTable<AmdViMeta57, AmdViPte, Alloc>;
 
 #[cfg(test)]
 mod tests {
