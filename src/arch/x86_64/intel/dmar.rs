@@ -3,7 +3,7 @@
 use core::fmt;
 
 use acpi::{
-    AcpiTable, Handler, PhysicalMapping,
+    AcpiError, AcpiTable, Handler, PhysicalMapping,
     sdt::{SdtHeader, Signature},
 };
 use memory_addr::{PhysAddr, PhysAddrRange};
@@ -24,12 +24,14 @@ const DMAR_DRHD: u16 = 0;
 const DMAR_RMRR: u16 = 1;
 const DMAR_ATSR: u16 = 2;
 const DMAR_RHSA: u16 = 3;
+const DMAR_ANDD: u16 = 4;
 const DMAR_SATC: u16 = 5;
 
 const DRHD_MIN_LENGTH: usize = 16;
 const RMRR_MIN_LENGTH: usize = 24;
 const ATSR_MIN_LENGTH: usize = 8;
 const RHSA_MIN_LENGTH: usize = 20;
+const ANDD_MIN_LENGTH: usize = 8;
 const SATC_MIN_LENGTH: usize = 8;
 const DEVICE_SCOPE_HEADER_LENGTH: usize = 6;
 const VTD_REGISTER_WINDOW_SIZE: usize = 0x1000;
@@ -44,11 +46,19 @@ pub const DMAR_REQUESTER_WINDOW_CAPACITY: usize = 16;
 
 pub type DmarBdfRangeSet = BdfRangeSet<DMAR_REQUESTER_WINDOW_CAPACITY>;
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug)]
 pub enum DmarError {
+    Acpi(AcpiError),
     Table(AcpiTableBytesError),
     BdfRanges(BdfRangeSetError),
     Malformed(&'static str),
+}
+
+impl From<AcpiError> for DmarError {
+    #[inline]
+    fn from(value: AcpiError) -> Self {
+        Self::Acpi(value)
+    }
 }
 
 impl From<AcpiTableBytesError> for DmarError {
@@ -68,6 +78,7 @@ impl From<BdfRangeSetError> for DmarError {
 impl fmt::Display for DmarError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            Self::Acpi(error) => write!(f, "{error:?}"),
             Self::Table(error) => write!(f, "{error}"),
             Self::BdfRanges(error) => write!(f, "{error}"),
             Self::Malformed(message) => f.write_str(message),
@@ -125,7 +136,7 @@ pub struct DmarTable<'a> {
 
 impl<'a> DmarTable<'a> {
     pub fn parse(bytes: &'a [u8]) -> Result<Self, DmarError> {
-        let sdt = SdtBytes::new(bytes, DmarAcpiTable::SIGNATURE)?;
+        let sdt = SdtBytes::new_for::<DmarAcpiTable>(bytes)?;
         if sdt.len() < DMAR_STRUCTURES_OFFSET {
             return Err(DmarError::Malformed("DMAR table shorter than fixed header"));
         }
@@ -138,7 +149,8 @@ impl<'a> DmarTable<'a> {
     where
         H: Handler,
     {
-        let sdt = SdtBytes::from_mapping(mapping, DmarAcpiTable::SIGNATURE)?;
+        mapping.validate()?;
+        let sdt = SdtBytes::from_mapping(mapping)?;
         if sdt.len() < DMAR_STRUCTURES_OFFSET {
             return Err(DmarError::Malformed("DMAR table shorter than fixed header"));
         }
@@ -217,6 +229,18 @@ impl<'a> DmarTable<'a> {
         })
     }
 
+    pub fn for_each_andd<F>(self, mut f: F) -> Result<(), DmarError>
+    where
+        F: FnMut(DmarAndd<'a>) -> Result<(), DmarError>,
+    {
+        self.for_each_structure(|structure| {
+            if let DmarStructure::Andd(device) = structure {
+                f(device)?;
+            }
+            Ok(())
+        })
+    }
+
     pub fn for_each_satc<F>(self, mut f: F) -> Result<(), DmarError>
     where
         F: FnMut(DmarSatc) -> Result<(), DmarError>,
@@ -227,6 +251,34 @@ impl<'a> DmarTable<'a> {
             }
             Ok(())
         })
+    }
+
+    pub fn for_each_drhd_device_scope<F>(self, unit: DmarDrhd, f: F) -> Result<(), DmarError>
+    where
+        F: FnMut(DmarDeviceScope<'a>) -> Result<(), DmarError>,
+    {
+        self.walk_device_scopes(unit.structure_offset, DRHD_MIN_LENGTH, unit.length, f)
+    }
+
+    pub fn for_each_rmrr_device_scope<F>(self, region: DmarRmrr, f: F) -> Result<(), DmarError>
+    where
+        F: FnMut(DmarDeviceScope<'a>) -> Result<(), DmarError>,
+    {
+        self.walk_device_scopes(region.structure_offset, RMRR_MIN_LENGTH, region.length, f)
+    }
+
+    pub fn for_each_atsr_device_scope<F>(self, unit: DmarAtsr, f: F) -> Result<(), DmarError>
+    where
+        F: FnMut(DmarDeviceScope<'a>) -> Result<(), DmarError>,
+    {
+        self.walk_device_scopes(unit.structure_offset, ATSR_MIN_LENGTH, unit.length, f)
+    }
+
+    pub fn for_each_satc_device_scope<F>(self, unit: DmarSatc, f: F) -> Result<(), DmarError>
+    where
+        F: FnMut(DmarDeviceScope<'a>) -> Result<(), DmarError>,
+    {
+        self.walk_device_scopes(unit.structure_offset, SATC_MIN_LENGTH, unit.length, f)
     }
 
     pub fn drhd_bdf_ranges(
@@ -410,9 +462,23 @@ impl<'a> DmarTable<'a> {
         Ok(proximity_domain)
     }
 
+    pub fn andd_name_for_device_number(
+        self,
+        acpi_device_number: u8,
+    ) -> Result<Option<&'a [u8]>, DmarError> {
+        let mut object_name = None;
+        self.for_each_andd(|andd| {
+            if andd.acpi_device_number == acpi_device_number {
+                object_name = Some(andd.object_name);
+            }
+            Ok(())
+        })?;
+        Ok(object_name)
+    }
+
     fn for_each_structure<F>(self, mut f: F) -> Result<(), DmarError>
     where
-        F: FnMut(DmarStructure) -> Result<(), DmarError>,
+        F: FnMut(DmarStructure<'a>) -> Result<(), DmarError>,
     {
         for structure in self.structures() {
             f(structure?)?;
@@ -425,12 +491,13 @@ impl<'a> DmarTable<'a> {
         offset: usize,
         length: usize,
         kind: u16,
-    ) -> Result<DmarStructure, DmarError> {
+    ) -> Result<DmarStructure<'a>, DmarError> {
         match kind {
             DMAR_DRHD => Ok(DmarStructure::Drhd(self.parse_drhd(offset, length)?)),
             DMAR_RMRR => Ok(DmarStructure::Rmrr(self.parse_rmrr(offset, length)?)),
             DMAR_ATSR => Ok(DmarStructure::Atsr(self.parse_atsr(offset, length)?)),
             DMAR_RHSA => Ok(DmarStructure::Rhsa(self.parse_rhsa(offset, length)?)),
+            DMAR_ANDD => Ok(DmarStructure::Andd(self.parse_andd(offset, length)?)),
             DMAR_SATC => Ok(DmarStructure::Satc(self.parse_satc(offset, length)?)),
             other => Ok(DmarStructure::Unknown(DmarUnknown {
                 kind: other,
@@ -460,6 +527,18 @@ impl<'a> DmarTable<'a> {
             has_device_scopes: length > DRHD_MIN_LENGTH,
             structure_offset: offset,
             length,
+        })
+    }
+
+    fn parse_andd(self, offset: usize, length: usize) -> Result<DmarAndd<'a>, DmarError> {
+        if length < ANDD_MIN_LENGTH {
+            return Err(DmarError::Malformed(
+                "DMAR ANDD structure shorter than minimum",
+            ));
+        }
+        Ok(DmarAndd {
+            acpi_device_number: self.sdt.read_u8(offset + 7)?,
+            object_name: &self.sdt.bytes()[offset + ANDD_MIN_LENGTH..offset + length],
         })
     }
 
@@ -547,7 +626,7 @@ impl<'a> DmarTable<'a> {
         mut f: F,
     ) -> Result<(), DmarError>
     where
-        F: FnMut(DmarDeviceScope) -> Result<(), DmarError>,
+        F: FnMut(DmarDeviceScope<'a>) -> Result<(), DmarError>,
     {
         let mut offset = scopes_offset;
         while offset < structure_length {
@@ -577,28 +656,19 @@ impl<'a> DmarTable<'a> {
                 ));
             }
 
-            let mut last_device = None;
-            let mut last_function = None;
-            let mut path_offset = DEVICE_SCOPE_HEADER_LENGTH;
-            while path_offset < scope_length {
-                last_device = Some(self.sdt.read_u8(scope_offset + path_offset)?);
-                last_function = Some(self.sdt.read_u8(scope_offset + path_offset + 1)?);
-                path_offset += 2;
-            }
             let start_bus = self.sdt.read_u8(scope_offset + 5)?;
-            let path_depth = path_bytes / 2;
-            let requester = match (last_device, last_function) {
-                (Some(device), Some(function)) if path_depth == 1 => {
-                    Bdf::new(start_bus, device, function)
-                        .ok()
-                        .map(BdfRange::single)
-                }
-                _ => None,
+            let path_start = scope_offset + DEVICE_SCOPE_HEADER_LENGTH;
+            let path_end = scope_offset + scope_length;
+            let path = DmarDeviceScopePath {
+                bytes: &self.sdt.bytes()[path_start..path_end],
             };
+            let requester = path.single_requester(start_bus).ok().map(BdfRange::single);
 
             f(DmarDeviceScope {
                 kind: DmarDeviceScopeKind::from_raw(self.sdt.read_u8(scope_offset)?),
                 enumeration_id: self.sdt.read_u8(scope_offset + 4)?,
+                start_bus,
+                path,
                 requester,
             })?;
 
@@ -613,8 +683,8 @@ pub struct DmarStructures<'a> {
     offset: usize,
 }
 
-impl Iterator for DmarStructures<'_> {
-    type Item = Result<DmarStructure, DmarError>;
+impl<'a> Iterator for DmarStructures<'a> {
+    type Item = Result<DmarStructure<'a>, DmarError>;
 
     fn next(&mut self) -> Option<Self::Item> {
         if self.offset >= self.table.sdt.len() {
@@ -655,11 +725,12 @@ impl Iterator for DmarStructures<'_> {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum DmarStructure {
+pub enum DmarStructure<'a> {
     Drhd(DmarDrhd),
     Rmrr(DmarRmrr),
     Atsr(DmarAtsr),
     Rhsa(DmarRhsa),
+    Andd(DmarAndd<'a>),
     Satc(DmarSatc),
     Unknown(DmarUnknown),
 }
@@ -708,6 +779,12 @@ pub struct DmarRhsa {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct DmarAndd<'a> {
+    pub acpi_device_number: u8,
+    pub object_name: &'a [u8],
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct DmarSatc {
     pub flags: u8,
     pub segment: u16,
@@ -718,10 +795,64 @@ pub struct DmarSatc {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct DmarDeviceScope {
+pub struct DmarDeviceScope<'a> {
     pub kind: DmarDeviceScopeKind,
     pub enumeration_id: u8,
+    pub start_bus: u8,
+    pub path: DmarDeviceScopePath<'a>,
     pub requester: Option<BdfRange>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct DmarDeviceScopePath<'a> {
+    bytes: &'a [u8],
+}
+
+impl<'a> DmarDeviceScopePath<'a> {
+    #[inline]
+    pub const fn as_bytes(self) -> &'a [u8] {
+        self.bytes
+    }
+
+    #[inline]
+    pub const fn depth(self) -> usize {
+        self.bytes.len() / 2
+    }
+
+    #[inline]
+    pub fn entry(self, index: usize) -> Option<DmarDeviceScopePathEntry> {
+        let offset = index.checked_mul(2)?;
+        let device = *self.bytes.get(offset)?;
+        let function = *self.bytes.get(offset + 1)?;
+        Some(DmarDeviceScopePathEntry { device, function })
+    }
+
+    #[inline]
+    pub fn last_entry(self) -> Option<DmarDeviceScopePathEntry> {
+        self.depth()
+            .checked_sub(1)
+            .and_then(|index| self.entry(index))
+    }
+
+    #[inline]
+    pub fn single_requester(self, start_bus: u8) -> Result<Bdf, DmarError> {
+        if self.depth() != 1 {
+            return Err(DmarError::Malformed(
+                "DMAR scope path is not a single requester",
+            ));
+        }
+        let entry = self
+            .entry(0)
+            .ok_or(DmarError::Malformed("DMAR scope path missing requester"))?;
+        Bdf::new(start_bus, entry.device, entry.function)
+            .map_err(|_| DmarError::Malformed("DMAR scope requester BDF is invalid"))
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct DmarDeviceScopePathEntry {
+    pub device: u8,
+    pub function: u8,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -872,5 +1003,60 @@ mod tests {
             })
             .unwrap();
         assert!(satc.unwrap().atc_required);
+    }
+
+    #[test]
+    fn parses_andd_and_preserves_multi_hop_scope_path() {
+        let mut dmar = [0u8; 86];
+        write_sdt_header(&mut dmar, Signature::DMAR, 86);
+        dmar[36] = 47;
+
+        dmar[48..50].copy_from_slice(&0u16.to_le_bytes());
+        dmar[50..52].copy_from_slice(&26u16.to_le_bytes());
+        dmar[56..64].copy_from_slice(&(0xfed9_0000u64).to_le_bytes());
+
+        dmar[64] = 5;
+        dmar[65] = 10;
+        dmar[68] = 7;
+        dmar[69] = 0x2a;
+        dmar[70] = 0x1c;
+        dmar[71] = 0;
+        dmar[72] = 5;
+        dmar[73] = 1;
+
+        dmar[74..76].copy_from_slice(&4u16.to_le_bytes());
+        dmar[76..78].copy_from_slice(&12u16.to_le_bytes());
+        dmar[81] = 7;
+        dmar[82..86].copy_from_slice(b"DEV0");
+
+        let table = DmarTable::parse(&dmar).unwrap();
+        let structures: heapless::Vec<_, 2> = table.structures().collect::<Result<_, _>>().unwrap();
+        assert!(
+            matches!(structures.as_slice(), [DmarStructure::Drhd(_), DmarStructure::Andd(andd)]
+                if andd.acpi_device_number == 7 && andd.object_name == b"DEV0")
+        );
+        assert_eq!(
+            table.andd_name_for_device_number(7).unwrap(),
+            Some(&b"DEV0"[..])
+        );
+
+        let DmarStructure::Drhd(unit) = structures[0] else {
+            panic!("expected DRHD");
+        };
+        let mut scope = None;
+        table
+            .for_each_drhd_device_scope(unit, |s| {
+                scope = Some(s);
+                Ok(())
+            })
+            .unwrap();
+        let scope = scope.unwrap();
+        assert_eq!(scope.kind, super::DmarDeviceScopeKind::NamespaceDevice);
+        assert_eq!(scope.enumeration_id, 7);
+        assert_eq!(scope.start_bus, 0x2a);
+        assert_eq!(scope.path.depth(), 2);
+        assert_eq!(scope.path.entry(0).unwrap().device, 0x1c);
+        assert_eq!(scope.path.entry(1).unwrap().function, 1);
+        assert_eq!(scope.requester, None);
     }
 }

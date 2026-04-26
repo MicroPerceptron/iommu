@@ -7,8 +7,10 @@
 
 use core::{fmt, mem::size_of, ptr};
 
-use acpi::sdt::Signature;
-use acpi::{Handler, PhysicalMapping, sdt::SdtHeader};
+use acpi::{
+    AcpiTable, Handler, PhysicalMapping,
+    sdt::{SdtHeader, Signature},
+};
 
 const SDT_HEADER_LEN: usize = size_of::<SdtHeader>();
 
@@ -60,7 +62,11 @@ pub(crate) struct SdtBytes<'a> {
 
 #[allow(dead_code)]
 impl<'a> SdtBytes<'a> {
-    pub(crate) fn new(bytes: &'a [u8], signature: Signature) -> Result<Self, AcpiTableBytesError> {
+    pub(crate) fn new_for<T: AcpiTable>(bytes: &'a [u8]) -> Result<Self, AcpiTableBytesError> {
+        Self::new(bytes, T::SIGNATURE)
+    }
+
+    fn new(bytes: &'a [u8], signature: Signature) -> Result<Self, AcpiTableBytesError> {
         if bytes.len() < SDT_HEADER_LEN {
             return Err(AcpiTableBytesError::Truncated {
                 needed: SDT_HEADER_LEN,
@@ -96,10 +102,10 @@ impl<'a> SdtBytes<'a> {
 
     pub(crate) fn from_mapping<H, T>(
         mapping: &'a PhysicalMapping<H, T>,
-        signature: Signature,
     ) -> Result<Self, AcpiTableBytesError>
     where
         H: Handler,
+        T: AcpiTable,
     {
         let bytes = unsafe {
             core::slice::from_raw_parts(
@@ -107,7 +113,7 @@ impl<'a> SdtBytes<'a> {
                 mapping.region_length,
             )
         };
-        Self::new(bytes, signature)
+        Self::new(bytes, T::SIGNATURE)
     }
 
     #[inline]

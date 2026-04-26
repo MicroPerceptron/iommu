@@ -3,7 +3,7 @@
 use core::fmt;
 
 use acpi::{
-    AcpiTable, Handler, PhysicalMapping,
+    AcpiError, AcpiTable, Handler, PhysicalMapping,
     sdt::{SdtHeader, Signature},
 };
 use memory_addr::{PhysAddr, PhysAddrRange};
@@ -53,7 +53,11 @@ const DEVENTRY_RANGE_START: u8 = 0x03;
 const DEVENTRY_RANGE_END: u8 = 0x04;
 const DEVENTRY_ALIAS_SELECT: u8 = 0x42;
 const DEVENTRY_ALIAS_RANGE_START: u8 = 0x43;
+const DEVENTRY_EXTENDED_SELECT: u8 = 0x46;
+const DEVENTRY_EXTENDED_RANGE_START: u8 = 0x47;
 const DEVENTRY_SPECIAL: u8 = 0x48;
+const DEVENTRY_ACPI_NAMED: u8 = 0xf0;
+const DEVENTRY_ACPI_NAMED_MIN_LENGTH: usize = 22;
 
 const IVHD_FLAG_IOTLB_SUP: u8 = 1 << 4;
 const IVHD_FLAG_COHERENT: u8 = 1 << 5;
@@ -65,11 +69,19 @@ pub const IVRS_REQUESTER_WINDOW_CAPACITY: usize = 16;
 
 pub type IvrsBdfRangeSet = BdfRangeSet<IVRS_REQUESTER_WINDOW_CAPACITY>;
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug)]
 pub enum IvrsError {
+    Acpi(AcpiError),
     Table(AcpiTableBytesError),
     BdfRanges(BdfRangeSetError),
     Malformed(&'static str),
+}
+
+impl From<AcpiError> for IvrsError {
+    #[inline]
+    fn from(value: AcpiError) -> Self {
+        Self::Acpi(value)
+    }
 }
 
 impl From<AcpiTableBytesError> for IvrsError {
@@ -89,6 +101,7 @@ impl From<BdfRangeSetError> for IvrsError {
 impl fmt::Display for IvrsError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            Self::Acpi(error) => write!(f, "{error:?}"),
             Self::Table(error) => write!(f, "{error}"),
             Self::BdfRanges(error) => write!(f, "{error}"),
             Self::Malformed(message) => f.write_str(message),
@@ -144,7 +157,7 @@ pub struct IvrsTable<'a> {
 
 impl<'a> IvrsTable<'a> {
     pub fn parse(bytes: &'a [u8]) -> Result<Self, IvrsError> {
-        let sdt = SdtBytes::new(bytes, IvrsAcpiTable::SIGNATURE)?;
+        let sdt = SdtBytes::new_for::<IvrsAcpiTable>(bytes)?;
         if sdt.len() < IVRS_BLOCKS_OFFSET {
             return Err(IvrsError::Malformed("IVRS table shorter than fixed header"));
         }
@@ -157,7 +170,8 @@ impl<'a> IvrsTable<'a> {
     where
         H: Handler,
     {
-        let sdt = SdtBytes::from_mapping(mapping, IvrsAcpiTable::SIGNATURE)?;
+        mapping.validate()?;
+        let sdt = SdtBytes::from_mapping(mapping)?;
         if sdt.len() < IVRS_BLOCKS_OFFSET {
             return Err(IvrsError::Malformed("IVRS table shorter than fixed header"));
         }
@@ -234,18 +248,23 @@ impl<'a> IvrsTable<'a> {
                 device_entries_offset(unit.block_type),
                 unit.length,
                 |entry| match entry {
-                    IvhdDeviceEntry::All => {
+                    IvhdDeviceEntry::All { .. } => {
                         saw_all = true;
                         Ok(())
                     }
-                    IvhdDeviceEntry::Select(device_id)
-                    | IvhdDeviceEntry::AliasSelect(device_id, _)
-                    | IvhdDeviceEntry::Special(device_id, _) => {
+                    IvhdDeviceEntry::Select { device_id, .. }
+                    | IvhdDeviceEntry::AliasSelect { device_id, .. }
+                    | IvhdDeviceEntry::ExtendedSelect { device_id, .. }
+                    | IvhdDeviceEntry::Special { device_id, .. }
+                    | IvhdDeviceEntry::AcpiNamed { device_id, .. } => {
                         ranges.insert_single::<IvrsError>(device_id)
                     }
-                    IvhdDeviceEntry::Range(start, end) => ranges.insert::<IvrsError>(
-                        BdfRange::inclusive(start, end).map_err(BdfRangeSetError::from)?,
-                    ),
+                    IvhdDeviceEntry::Range { start, end, .. }
+                    | IvhdDeviceEntry::AliasRange { start, end, .. }
+                    | IvhdDeviceEntry::ExtendedRange { start, end, .. } => ranges
+                        .insert::<IvrsError>(
+                            BdfRange::inclusive(start, end).map_err(BdfRangeSetError::from)?,
+                        ),
                     IvhdDeviceEntry::Pad => Ok(()),
                 },
             )
@@ -301,11 +320,15 @@ impl<'a> IvrsTable<'a> {
         if length > entries_offset {
             self.walk_device_entries(offset, entries_offset, length, |entry| {
                 match entry {
-                    IvhdDeviceEntry::All => include_all = true,
-                    IvhdDeviceEntry::Select(_)
-                    | IvhdDeviceEntry::Range(_, _)
-                    | IvhdDeviceEntry::AliasSelect(_, _)
-                    | IvhdDeviceEntry::Special(_, _) => has_device_scopes = true,
+                    IvhdDeviceEntry::All { .. } => include_all = true,
+                    IvhdDeviceEntry::Select { .. }
+                    | IvhdDeviceEntry::Range { .. }
+                    | IvhdDeviceEntry::AliasSelect { .. }
+                    | IvhdDeviceEntry::AliasRange { .. }
+                    | IvhdDeviceEntry::ExtendedSelect { .. }
+                    | IvhdDeviceEntry::ExtendedRange { .. }
+                    | IvhdDeviceEntry::Special { .. }
+                    | IvhdDeviceEntry::AcpiNamed { .. } => has_device_scopes = true,
                     IvhdDeviceEntry::Pad => {}
                 }
                 Ok(())
@@ -370,7 +393,7 @@ impl<'a> IvrsTable<'a> {
         mut f: F,
     ) -> Result<(), IvrsError>
     where
-        F: FnMut(IvhdDeviceEntry) -> Result<(), IvrsError>,
+        F: FnMut(IvhdDeviceEntry<'a>) -> Result<(), IvrsError>,
     {
         let mut offset = entries_offset;
         let mut pending_range_start = None;
@@ -381,7 +404,16 @@ impl<'a> IvrsTable<'a> {
             let entry_size = match entry_type {
                 0x00..=0x04 => 4usize,
                 0x42 | 0x43 | 0x46 | 0x47 | 0x48 => 8usize,
-                0xf0.. => break,
+                DEVENTRY_ACPI_NAMED => {
+                    if offset + DEVENTRY_ACPI_NAMED_MIN_LENGTH > block_length {
+                        return Err(IvrsError::Malformed(
+                            "IVHD ACPI named device entry truncated before UID length",
+                        ));
+                    }
+                    DEVENTRY_ACPI_NAMED_MIN_LENGTH
+                        + usize::from(self.sdt.read_u8(entry_offset + 21)?)
+                }
+                0xf1.. => break,
                 _ => 4usize,
             };
 
@@ -389,30 +421,102 @@ impl<'a> IvrsTable<'a> {
                 return Err(IvrsError::Malformed("IVHD device entry extends past block"));
             }
 
-            let device_id = Bdf::from_u16(self.sdt.read_u16(entry_offset + 2)?);
+            let (device_id, data_setting) = if entry_type == DEVENTRY_ACPI_NAMED {
+                (
+                    Bdf::from_u16(self.sdt.read_u16(entry_offset + 1)?),
+                    self.sdt.read_u8(entry_offset + 3)?,
+                )
+            } else {
+                (
+                    Bdf::from_u16(self.sdt.read_u16(entry_offset + 2)?),
+                    self.sdt.read_u8(entry_offset + 1)?,
+                )
+            };
             match entry_type {
                 DEVENTRY_PAD => f(IvhdDeviceEntry::Pad)?,
-                DEVENTRY_ALL => f(IvhdDeviceEntry::All)?,
-                DEVENTRY_SELECT => f(IvhdDeviceEntry::Select(device_id))?,
-                DEVENTRY_RANGE_START | DEVENTRY_ALIAS_RANGE_START => {
-                    pending_range_start = Some(device_id);
+                DEVENTRY_ALL => f(IvhdDeviceEntry::All { data_setting })?,
+                DEVENTRY_SELECT => f(IvhdDeviceEntry::Select {
+                    device_id,
+                    data_setting,
+                })?,
+                DEVENTRY_RANGE_START => {
+                    pending_range_start = Some(PendingIvhdRange {
+                        start: device_id,
+                        kind: PendingIvhdRangeKind::Plain,
+                        data_setting,
+                    });
+                }
+                DEVENTRY_ALIAS_RANGE_START => {
+                    pending_range_start = Some(PendingIvhdRange {
+                        start: device_id,
+                        kind: PendingIvhdRangeKind::Alias {
+                            source: Bdf::from_u16(self.sdt.read_u16(entry_offset + 6)?),
+                        },
+                        data_setting,
+                    });
+                }
+                DEVENTRY_EXTENDED_RANGE_START => {
+                    pending_range_start = Some(PendingIvhdRange {
+                        start: device_id,
+                        kind: PendingIvhdRangeKind::Extended {
+                            extended_data_setting: self.sdt.read_u32(entry_offset + 4)?,
+                        },
+                        data_setting,
+                    });
                 }
                 DEVENTRY_RANGE_END => {
                     if let Some(start) = pending_range_start.take() {
-                        if device_id < start {
+                        if device_id < start.start {
                             return Err(IvrsError::Malformed("IVHD device range is reversed"));
                         }
-                        f(IvhdDeviceEntry::Range(start, device_id))?;
+                        match start.kind {
+                            PendingIvhdRangeKind::Plain => f(IvhdDeviceEntry::Range {
+                                start: start.start,
+                                end: device_id,
+                                data_setting: start.data_setting,
+                            })?,
+                            PendingIvhdRangeKind::Alias { source } => {
+                                f(IvhdDeviceEntry::AliasRange {
+                                    start: start.start,
+                                    end: device_id,
+                                    source,
+                                    data_setting: start.data_setting,
+                                })?
+                            }
+                            PendingIvhdRangeKind::Extended {
+                                extended_data_setting,
+                            } => f(IvhdDeviceEntry::ExtendedRange {
+                                start: start.start,
+                                end: device_id,
+                                data_setting: start.data_setting,
+                                extended_data_setting,
+                            })?,
+                        }
                     }
                 }
-                DEVENTRY_ALIAS_SELECT => f(IvhdDeviceEntry::AliasSelect(
+                DEVENTRY_ALIAS_SELECT => f(IvhdDeviceEntry::AliasSelect {
                     device_id,
-                    Bdf::from_u16(self.sdt.read_u16(entry_offset + 6)?),
-                ))?,
-                DEVENTRY_SPECIAL => f(IvhdDeviceEntry::Special(
-                    Bdf::from_u16(self.sdt.read_u16(entry_offset + 6)?),
-                    self.sdt.read_u8(entry_offset + 1)?,
-                ))?,
+                    source: Bdf::from_u16(self.sdt.read_u16(entry_offset + 6)?),
+                    data_setting,
+                })?,
+                DEVENTRY_EXTENDED_SELECT => f(IvhdDeviceEntry::ExtendedSelect {
+                    device_id,
+                    data_setting,
+                    extended_data_setting: self.sdt.read_u32(entry_offset + 4)?,
+                })?,
+                DEVENTRY_SPECIAL => f(IvhdDeviceEntry::Special {
+                    device_id: Bdf::from_u16(self.sdt.read_u16(entry_offset + 6)?),
+                    variety: data_setting,
+                })?,
+                DEVENTRY_ACPI_NAMED => f(IvhdDeviceEntry::AcpiNamed {
+                    device_id,
+                    data_setting,
+                    hardware_id: self.sdt.read_u64(entry_offset + 4)?,
+                    compatible_id: self.sdt.read_u64(entry_offset + 12)?,
+                    uid_format: self.sdt.read_u8(entry_offset + 20)?,
+                    uid: &self.sdt.bytes()
+                        [entry_offset + DEVENTRY_ACPI_NAMED_MIN_LENGTH..entry_offset + entry_size],
+                })?,
                 _ => {}
             }
 
@@ -568,13 +672,68 @@ impl Ivmd {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum IvhdDeviceEntry {
+struct PendingIvhdRange {
+    start: Bdf,
+    kind: PendingIvhdRangeKind,
+    data_setting: u8,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum PendingIvhdRangeKind {
+    Plain,
+    Alias { source: Bdf },
+    Extended { extended_data_setting: u32 },
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum IvhdDeviceEntry<'a> {
     Pad,
-    All,
-    Select(Bdf),
-    Range(Bdf, Bdf),
-    AliasSelect(Bdf, Bdf),
-    Special(Bdf, u8),
+    All {
+        data_setting: u8,
+    },
+    Select {
+        device_id: Bdf,
+        data_setting: u8,
+    },
+    Range {
+        start: Bdf,
+        end: Bdf,
+        data_setting: u8,
+    },
+    AliasSelect {
+        device_id: Bdf,
+        source: Bdf,
+        data_setting: u8,
+    },
+    AliasRange {
+        start: Bdf,
+        end: Bdf,
+        source: Bdf,
+        data_setting: u8,
+    },
+    ExtendedSelect {
+        device_id: Bdf,
+        data_setting: u8,
+        extended_data_setting: u32,
+    },
+    ExtendedRange {
+        start: Bdf,
+        end: Bdf,
+        data_setting: u8,
+        extended_data_setting: u32,
+    },
+    Special {
+        device_id: Bdf,
+        variety: u8,
+    },
+    AcpiNamed {
+        device_id: Bdf,
+        data_setting: u8,
+        hardware_id: u64,
+        compatible_id: u64,
+        uid_format: u8,
+        uid: &'a [u8],
+    },
 }
 
 #[inline]
@@ -589,7 +748,7 @@ pub use crate::firm::pcie::BdfRange as IvrsBdfRange;
 
 #[cfg(test)]
 mod tests {
-    use super::{IvrsBdfRange, IvrsBlock, IvrsTable};
+    use super::{IvhdDeviceEntry, IvrsBdfRange, IvrsBlock, IvrsTable};
     use crate::firm::pcie::Bdf;
     use crate::{MmioAddr, MmioAddrRange, MmioRange};
     use acpi::sdt::Signature;
@@ -671,5 +830,82 @@ mod tests {
             PhysAddrRange::from_start_size(PhysAddr::from_usize(0x2000_0000), 0x2000)
         );
         assert_eq!(memory.limit_address(), PhysAddr::from_usize(0x2000_1fff));
+    }
+
+    #[test]
+    fn parses_extended_and_acpi_named_ivhd_entries() {
+        let mut ivrs = [0u8; 122];
+        write_sdt_header(&mut ivrs, Signature::IVRS, 122);
+
+        ivrs[48] = 0x11;
+        ivrs[49] = 1 << 5;
+        ivrs[50..52].copy_from_slice(&74u16.to_le_bytes());
+        ivrs[52..54].copy_from_slice(&0x0100u16.to_le_bytes());
+        ivrs[54..56].copy_from_slice(&0x40u16.to_le_bytes());
+        ivrs[56..64].copy_from_slice(&(0xfed8_0000u64).to_le_bytes());
+        ivrs[64..66].copy_from_slice(&2u16.to_le_bytes());
+        ivrs[66..68].copy_from_slice(&0x55u16.to_le_bytes());
+        ivrs[72..80].copy_from_slice(&0x1122_3344_5566_7788u64.to_le_bytes());
+
+        ivrs[88] = 0x46;
+        ivrs[89] = 0xaa;
+        ivrs[90..92].copy_from_slice(&0x0123u16.to_le_bytes());
+        ivrs[92..96].copy_from_slice(&0xdead_beefu32.to_le_bytes());
+
+        ivrs[96] = 0xf0;
+        ivrs[97..99].copy_from_slice(&0x00a5u16.to_le_bytes());
+        ivrs[99] = 0x40;
+        ivrs[100..108].copy_from_slice(b"AMDI0020");
+        ivrs[108..116].copy_from_slice(&0u64.to_le_bytes());
+        ivrs[116] = 2;
+        ivrs[117] = 4;
+        ivrs[118..122].copy_from_slice(b"ID01");
+
+        let table = IvrsTable::parse(&ivrs).unwrap();
+        let blocks: heapless::Vec<_, 2> = table.blocks().collect::<Result<_, _>>().unwrap();
+        let IvrsBlock::Ivhd(unit) = blocks[0] else {
+            panic!("expected IVHD");
+        };
+
+        let mut entries = heapless::Vec::<_, 4>::new();
+        table
+            .walk_device_entries(
+                unit.block_offset,
+                super::device_entries_offset(unit.block_type),
+                unit.length,
+                |entry| {
+                    entries.push(entry).unwrap();
+                    Ok(())
+                },
+            )
+            .unwrap();
+
+        assert!(matches!(entries[0], IvhdDeviceEntry::ExtendedSelect {
+                device_id,
+                data_setting: 0xaa,
+                extended_data_setting: 0xdead_beef,
+            } if device_id == Bdf::from_u16(0x0123)));
+        assert!(matches!(entries[1], IvhdDeviceEntry::AcpiNamed {
+                device_id,
+                data_setting: 0x40,
+                hardware_id,
+                compatible_id: 0,
+                uid_format: 2,
+                uid,
+            } if device_id == Bdf::from_u16(0x00a5)
+                && hardware_id == u64::from_le_bytes(*b"AMDI0020")
+                && uid == b"ID01"));
+
+        let ranges = table
+            .ivhd_bdf_ranges(registers(0xfed8_0000))
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            ranges.as_slice(),
+            &[
+                IvrsBdfRange::single(Bdf::from_u16(0x00a5)),
+                IvrsBdfRange::single(Bdf::from_u16(0x0123)),
+            ]
+        );
     }
 }
