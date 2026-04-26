@@ -34,7 +34,7 @@ pub use entry::{
 pub use tlb::{X86InvlpgbTlb, X86PcidTlb, X86Tlb};
 
 /// x86_64 4-level CPU page table: 48-bit canonical virtual addresses.
-pub type X86PageTable48<Alloc> = crate::PageTable<X86Meta48, X86Pte, Alloc>;
+pub type X86PageTable48<Alloc> = crate::PageTableWalker<X86Meta48, X86Pte, Alloc>;
 
 /// x86_64 5-level CPU page table: 57-bit canonical virtual addresses.
-pub type X86PageTable57<Alloc> = crate::PageTable<X86Meta57, X86Pte, Alloc>;
+pub type X86PageTable57<Alloc> = crate::PageTableWalker<X86Meta57, X86Pte, Alloc>;

@@ -1,6 +1,6 @@
 //! Generic page-table walker.
 //!
-//! [`PageTable<Meta, Entry, Alloc>`] is the single walker reused across
+//! [`PageTableWalker<Meta, Entry, Alloc>`] is the single walker reused across
 //! every arch and every consumer (CPU paging in kraph, future IOMMU
 //! contexts via vendor Entry impls). All semantic policy lives in the
 //! trait impls — this module only implements the *mechanism* of
@@ -43,12 +43,75 @@ use crate::{
 /// aarch64 4-level, riscv Sv39/Sv48/Sv57, AMD-Vi up to 6 levels).
 const MAX_LEVELS: usize = 6;
 
+/// Page-table operations over a typed virtual address space.
+///
+/// This is the public trait form of the walker surface. Concrete CPU
+/// page tables use `memory_addr::VirtAddr`; IOMMU consumers can bind
+/// `PagingMetaData::VirtAddr` to their own typed IOVA address.
+pub trait PageTable<V: MemoryAddr> {
+    const INPUT_ADDR_BITS: u8;
+    const OUTPUT_ADDR_BITS: u8;
+
+    type Entry: PageTableEntry;
+
+    fn root(&self) -> PhysAddr;
+
+    fn query(&self, vaddr: V) -> PagingResult<Mapping<Self::Entry, V>>;
+
+    fn map<'a, B, F, Tlb>(
+        &mut self,
+        range: AddrRange<V>,
+        backing: B,
+        flags: F,
+        tlb: &Tlb,
+    ) -> PagingResult
+    where
+        B: IntoMapBacking<'a>,
+        F: Into<MappingFlags<<Self::Entry as PageTableEntry>::Flags>>,
+        Tlb: TlbInvalidation<V>;
+
+    fn remap<Tlb>(
+        &mut self,
+        range: AddrRange<V>,
+        paddr: PhysAddr,
+        flags: <Self::Entry as PageTableEntry>::Flags,
+        tlb: &Tlb,
+    ) -> PagingResult<Mapping<Self::Entry, V>>
+    where
+        Tlb: TlbInvalidation<V>;
+
+    fn protect<Tlb>(
+        &mut self,
+        range: AddrRange<V>,
+        flags: <Self::Entry as PageTableEntry>::Flags,
+        tlb: &Tlb,
+    ) -> PagingResult<Mapping<Self::Entry, V>>
+    where
+        Tlb: TlbInvalidation<V>;
+
+    fn unmap<Tlb>(
+        &mut self,
+        range: AddrRange<V>,
+        tlb: &Tlb,
+    ) -> PagingResult<Mapping<Self::Entry, V>>
+    where
+        Tlb: TlbInvalidation<V>;
+
+    fn split_at<Tlb>(&mut self, range: AddrRange<V>, tlb: &Tlb) -> PagingResult<PageSize>
+    where
+        Tlb: TlbInvalidation<V>;
+
+    fn merge_at<Tlb>(&mut self, range: AddrRange<V>, tlb: &Tlb) -> PagingResult<PageSize>
+    where
+        Tlb: TlbInvalidation<V>;
+}
+
 /// Generic page-table walker.
 ///
 /// Consumers parameterize over per-arch [`PagingMetaData`], per-arch or
 /// per-vendor [`PageTableEntry`], and a static [`FrameAllocator`] that
 /// supplies + reclaims intermediate-table frames.
-pub struct PageTable<Meta, Entry, Alloc>
+pub struct PageTableWalker<Meta, Entry, Alloc>
 where
     Meta: PagingMetaData,
     Entry: PageTableEntry,
@@ -58,11 +121,11 @@ where
     _p: PhantomData<(Meta, Entry, Alloc)>,
 }
 
-// SAFETY: PageTable owns a physical frame address; the actual table
+// SAFETY: PageTableWalker owns a physical frame address; the actual table
 // memory is reached only through `Alloc::phys_to_virt` which returns a
 // VirtAddr the consumer guarantees to be valid for the lifetime of the
-// PageTable. No interior mutability is shared across the boundary.
-unsafe impl<Meta, Entry, Alloc> Send for PageTable<Meta, Entry, Alloc>
+// PageTableWalker. No interior mutability is shared across the boundary.
+unsafe impl<Meta, Entry, Alloc> Send for PageTableWalker<Meta, Entry, Alloc>
 where
     Meta: PagingMetaData,
     Entry: PageTableEntry,
@@ -70,7 +133,7 @@ where
 {
 }
 
-unsafe impl<Meta, Entry, Alloc> Sync for PageTable<Meta, Entry, Alloc>
+unsafe impl<Meta, Entry, Alloc> Sync for PageTableWalker<Meta, Entry, Alloc>
 where
     Meta: PagingMetaData,
     Entry: PageTableEntry,
@@ -78,7 +141,7 @@ where
 {
 }
 
-impl<Meta, Entry, Alloc> PageTable<Meta, Entry, Alloc>
+impl<Meta, Entry, Alloc> PageTableWalker<Meta, Entry, Alloc>
 where
     Meta: PagingMetaData,
     Entry: PageTableEntry,
@@ -625,7 +688,108 @@ where
     }
 }
 
-impl<Meta, Entry, Alloc> Drop for PageTable<Meta, Entry, Alloc>
+impl<Meta, Entry, Alloc> PageTable<Meta::VirtAddr> for PageTableWalker<Meta, Entry, Alloc>
+where
+    Meta: PagingMetaData,
+    Entry: PageTableEntry,
+    Alloc: FrameAllocator,
+{
+    const INPUT_ADDR_BITS: u8 = Meta::VA_MAX_BITS as u8;
+    const OUTPUT_ADDR_BITS: u8 = Meta::PA_MAX_BITS as u8;
+
+    type Entry = Entry;
+
+    #[inline]
+    fn root(&self) -> PhysAddr {
+        PageTableWalker::root(self)
+    }
+
+    #[inline]
+    fn query(&self, vaddr: Meta::VirtAddr) -> PagingResult<Mapping<Entry, Meta::VirtAddr>> {
+        PageTableWalker::query(self, vaddr)
+    }
+
+    #[inline]
+    fn map<'a, B, F, Tlb>(
+        &mut self,
+        range: AddrRange<Meta::VirtAddr>,
+        backing: B,
+        flags: F,
+        tlb: &Tlb,
+    ) -> PagingResult
+    where
+        B: IntoMapBacking<'a>,
+        F: Into<MappingFlags<Entry::Flags>>,
+        Tlb: TlbInvalidation<Meta::VirtAddr>,
+    {
+        PageTableWalker::map(self, range, backing, flags, tlb)
+    }
+
+    #[inline]
+    fn remap<Tlb>(
+        &mut self,
+        range: AddrRange<Meta::VirtAddr>,
+        paddr: PhysAddr,
+        flags: Entry::Flags,
+        tlb: &Tlb,
+    ) -> PagingResult<Mapping<Entry, Meta::VirtAddr>>
+    where
+        Tlb: TlbInvalidation<Meta::VirtAddr>,
+    {
+        PageTableWalker::remap(self, range, paddr, flags, tlb)
+    }
+
+    #[inline]
+    fn protect<Tlb>(
+        &mut self,
+        range: AddrRange<Meta::VirtAddr>,
+        flags: Entry::Flags,
+        tlb: &Tlb,
+    ) -> PagingResult<Mapping<Entry, Meta::VirtAddr>>
+    where
+        Tlb: TlbInvalidation<Meta::VirtAddr>,
+    {
+        PageTableWalker::protect(self, range, flags, tlb)
+    }
+
+    #[inline]
+    fn unmap<Tlb>(
+        &mut self,
+        range: AddrRange<Meta::VirtAddr>,
+        tlb: &Tlb,
+    ) -> PagingResult<Mapping<Entry, Meta::VirtAddr>>
+    where
+        Tlb: TlbInvalidation<Meta::VirtAddr>,
+    {
+        PageTableWalker::unmap(self, range, tlb)
+    }
+
+    #[inline]
+    fn split_at<Tlb>(
+        &mut self,
+        range: AddrRange<Meta::VirtAddr>,
+        tlb: &Tlb,
+    ) -> PagingResult<PageSize>
+    where
+        Tlb: TlbInvalidation<Meta::VirtAddr>,
+    {
+        PageTableWalker::split_at(self, range, tlb)
+    }
+
+    #[inline]
+    fn merge_at<Tlb>(
+        &mut self,
+        range: AddrRange<Meta::VirtAddr>,
+        tlb: &Tlb,
+    ) -> PagingResult<PageSize>
+    where
+        Tlb: TlbInvalidation<Meta::VirtAddr>,
+    {
+        PageTableWalker::merge_at(self, range, tlb)
+    }
+}
+
+impl<Meta, Entry, Alloc> Drop for PageTableWalker<Meta, Entry, Alloc>
 where
     Meta: PagingMetaData,
     Entry: PageTableEntry,
@@ -685,7 +849,7 @@ impl FlushRange {
 /// reuse the cached descent and skip the corresponding root-side reads.
 ///
 /// Bulk-mapping a 1 GiB region as 4 KiB pages with a fresh
-/// [`PageTable::map`] call per entry costs `262144 × LEVELS` Entry reads;
+/// [`PageTableWalker::map`] call per entry costs `262144 × LEVELS` Entry reads;
 /// with a cursor it costs roughly `262144 + (LEVELS - 1) × outer-table-
 /// crossings`, plus a single batched TLB flush at the end.
 ///
@@ -697,7 +861,7 @@ impl FlushRange {
 ///
 /// # Lifetime
 ///
-/// The cursor borrows the [`PageTable`] mutably for its lifetime; while
+/// The cursor borrows the [`PageTableWalker`] mutably for its lifetime; while
 /// the cursor exists, the table cannot be mutated through any other
 /// path. This guarantees the cached descent stays valid.
 ///
@@ -714,7 +878,7 @@ where
     Alloc: FrameAllocator,
     Tlb: TlbInvalidation<Meta::VirtAddr>,
 {
-    pt: &'pt mut PageTable<Meta, Entry, Alloc>,
+    pt: &'pt mut PageTableWalker<Meta, Entry, Alloc>,
     tlb: &'pt Tlb,
     /// Frames cached by the previous walk, indexed `[level - 1]`:
     ///   `descent[L - 1] = Some(frame_phys)` means we know the table at
@@ -738,7 +902,7 @@ where
     Alloc: FrameAllocator,
     Tlb: TlbInvalidation<Meta::VirtAddr>,
 {
-    fn new(pt: &'pt mut PageTable<Meta, Entry, Alloc>, tlb: &'pt Tlb) -> Self {
+    fn new(pt: &'pt mut PageTableWalker<Meta, Entry, Alloc>, tlb: &'pt Tlb) -> Self {
         // Root is never stored in `descent` — the walker reads it
         // directly from `pt.root` on every walk start. Only levels
         // 1..LEVELS-1 (intermediate tables) get cached; the slot at
@@ -888,7 +1052,7 @@ where
     /// Map a virtually-contiguous range using cached descent where
     /// possible.
     ///
-    /// Same semantics as [`PageTable::map`] (refuses on conflict, etc.)
+    /// Same semantics as [`PageTableWalker::map`] (refuses on conflict, etc.)
     /// but TLB flush is queued for batched emission rather than fired
     /// immediately.
     fn map<'a, B, F>(
@@ -1122,7 +1286,7 @@ where
         Ok(())
     }
 
-    /// Unmap the leaf covering `vaddr`. As with [`PageTable::unmap`],
+    /// Unmap the leaf covering `vaddr`. As with [`PageTableWalker::unmap`],
     /// emptied intermediates are reclaimed; cached descent for those
     /// frames is invalidated.
     #[allow(dead_code)]
@@ -1130,7 +1294,7 @@ where
         &mut self,
         range: AddrRange<Meta::VirtAddr>,
     ) -> PagingResult<Mapping<Entry, Meta::VirtAddr>> {
-        // Falls back to PageTable::unmap-without-flush — descent
+        // Falls back to PageTableWalker::unmap-without-flush — descent
         // caching here is messier because reclaim may dealloc cached
         // frames mid-flight. Cleanest: invalidate every cached level
         // below root (root never moves).
@@ -1145,7 +1309,7 @@ where
         Ok(result)
     }
 
-    /// Batched form of [`PageTable::protect`] — flush is queued.
+    /// Batched form of [`PageTableWalker::protect`] — flush is queued.
     #[allow(dead_code)]
     fn protect(
         &mut self,
@@ -1157,7 +1321,7 @@ where
         Ok(mapping)
     }
 
-    /// Batched form of [`PageTable::remap`] — flush is queued.
+    /// Batched form of [`PageTableWalker::remap`] — flush is queued.
     #[allow(dead_code)]
     fn remap(
         &mut self,
@@ -1665,7 +1829,7 @@ mod tests {
     // Walker tests use NoFlush — they exercise the tree mechanics, not
     // the TLB layer. CPU TLB invalidation is covered separately in the
     // `arch::x86_64::X86Tlb` impl tests.
-    type Pt = PageTable<MockMeta, MockPte, MockAlloc>;
+    type Pt = PageTableWalker<MockMeta, MockPte, MockAlloc>;
 
     struct WideTableMeta;
 
@@ -1716,7 +1880,7 @@ mod tests {
         }
     }
 
-    type RecordingPt = PageTable<MockMeta, MockPte, MockAlloc>;
+    type RecordingPt = PageTableWalker<MockMeta, MockPte, MockAlloc>;
 
     const NO_FLUSH: NoFlush = NoFlush;
     const RECORDING_TLB: RecordingTlb = RecordingTlb;
@@ -1797,7 +1961,7 @@ mod tests {
     fn metadata_controls_table_frame_granule() {
         let _g = test_setup();
         {
-            let pt = PageTable::<WideTableMeta, MockPte, MockAlloc>::try_new().unwrap();
+            let pt = PageTableWalker::<WideTableMeta, MockPte, MockAlloc>::try_new().unwrap();
             assert!(PageSize::Size16K.is_aligned(pt.root().as_usize()));
             assert_eq!(LIVE_COUNT.load(Ordering::SeqCst), 1);
         }

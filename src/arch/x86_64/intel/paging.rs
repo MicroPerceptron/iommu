@@ -5,8 +5,8 @@ use core::fmt;
 use memory_addr::PhysAddr;
 
 use crate::{
-    AccessFlags, CachePolicy, IoviAddr, MemoryAttributes, PageSize, PageTable, PageTableEntry,
-    PageTableEntryKind, PagingMetaData,
+    AccessFlags, CachePolicy, IoviAddr, MemoryAttributes, PageSize, PageTableEntry,
+    PageTableEntryKind, PageTableWalker, PagingMetaData,
 };
 
 const ADDR_MASK: u64 = 0x000f_ffff_ffff_f000;
@@ -179,11 +179,11 @@ define_vtd_meta!(VtdSecondLevelMeta48, 4, 48);
 define_vtd_meta!(VtdSecondLevelMeta57, 5, 57);
 
 pub type VtdSecondLevelPageTable39<Alloc> =
-    PageTable<VtdSecondLevelMeta39, VtdSecondLevelPte, Alloc>;
+    PageTableWalker<VtdSecondLevelMeta39, VtdSecondLevelPte, Alloc>;
 pub type VtdSecondLevelPageTable48<Alloc> =
-    PageTable<VtdSecondLevelMeta48, VtdSecondLevelPte, Alloc>;
+    PageTableWalker<VtdSecondLevelMeta48, VtdSecondLevelPte, Alloc>;
 pub type VtdSecondLevelPageTable57<Alloc> =
-    PageTable<VtdSecondLevelMeta57, VtdSecondLevelPte, Alloc>;
+    PageTableWalker<VtdSecondLevelMeta57, VtdSecondLevelPte, Alloc>;
 
 #[cfg(test)]
 mod tests {

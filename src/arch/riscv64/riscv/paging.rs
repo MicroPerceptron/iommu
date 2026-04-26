@@ -1,6 +1,6 @@
 //! RISC-V IOMMU page-table aliases.
 
-use crate::{IoviAddr, PageSize, PageTable, PagingMetaData};
+use crate::{IoviAddr, PageSize, PageTableWalker, PagingMetaData};
 
 pub use kpte::arch::riscv64::{
     Rv64Flags as RvIommuFlags, Rv64Pte as RvIommuPte, Rv64SvpbmtPte as RvIommuSvpbmtPte,
@@ -41,13 +41,13 @@ define_rv_iommu_meta!(RvIommuMeta39, 3, 39);
 define_rv_iommu_meta!(RvIommuMeta48, 4, 48);
 define_rv_iommu_meta!(RvIommuMeta57, 5, 57);
 
-pub type RvIommuPageTable39<Alloc> = PageTable<RvIommuMeta39, RvIommuPte, Alloc>;
-pub type RvIommuPageTable48<Alloc> = PageTable<RvIommuMeta48, RvIommuPte, Alloc>;
-pub type RvIommuPageTable57<Alloc> = PageTable<RvIommuMeta57, RvIommuPte, Alloc>;
+pub type RvIommuPageTable39<Alloc> = PageTableWalker<RvIommuMeta39, RvIommuPte, Alloc>;
+pub type RvIommuPageTable48<Alloc> = PageTableWalker<RvIommuMeta48, RvIommuPte, Alloc>;
+pub type RvIommuPageTable57<Alloc> = PageTableWalker<RvIommuMeta57, RvIommuPte, Alloc>;
 
-pub type RvIommuSvpbmtPageTable39<Alloc> = PageTable<RvIommuMeta39, RvIommuSvpbmtPte, Alloc>;
-pub type RvIommuSvpbmtPageTable48<Alloc> = PageTable<RvIommuMeta48, RvIommuSvpbmtPte, Alloc>;
-pub type RvIommuSvpbmtPageTable57<Alloc> = PageTable<RvIommuMeta57, RvIommuSvpbmtPte, Alloc>;
+pub type RvIommuSvpbmtPageTable39<Alloc> = PageTableWalker<RvIommuMeta39, RvIommuSvpbmtPte, Alloc>;
+pub type RvIommuSvpbmtPageTable48<Alloc> = PageTableWalker<RvIommuMeta48, RvIommuSvpbmtPte, Alloc>;
+pub type RvIommuSvpbmtPageTable57<Alloc> = PageTableWalker<RvIommuMeta57, RvIommuSvpbmtPte, Alloc>;
 
 #[cfg(test)]
 mod tests {

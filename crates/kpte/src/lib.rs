@@ -10,7 +10,7 @@
 //! - Traits: [`PageTableEntry`], [`PagingMetaData`], [`FrameAllocator`]
 //! - Flags: [`AccessFlags`], [`MemoryAttributes`] — shared access/attr model
 //! - Mapping surface: [`Mapping`], [`MapBacking`], [`MappingFlags`]
-//! - Walker: [`PageTable`] with internal batching for whole-range maps
+//! - Walker: [`PageTableWalker`] with internal batching for whole-range maps
 //! - Per-arch PTE impls: `arch::x86_64`, `arch::aarch64`, `arch::riscv64`
 //!
 //! # Why not `page_table_multiarch`?
@@ -38,4 +38,4 @@ pub use meta::{AccessFlags, CachePolicy, Coherency, MemoryAttributes, PageSize, 
 pub use paging::{
     FrameAllocator, NoFlush, PageTableEntry, PageTableEntryKind, PagingMetaData, TlbInvalidation,
 };
-pub use walker::PageTable;
+pub use walker::{PageTable, PageTableWalker};

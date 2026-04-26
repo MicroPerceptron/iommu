@@ -1,6 +1,6 @@
 //! ARM SMMUv3 VMSA page-table aliases.
 
-use crate::{IoviAddr, PageSize, PageTable, PagingMetaData};
+use crate::{IoviAddr, PageSize, PageTableWalker, PagingMetaData};
 
 pub use kpte::arch::aarch64::{
     A64Flags as SmmuVmsaFlags, A64Pte4K48 as SmmuVmsaPte4K48, A64Pte4K52 as SmmuVmsaPte4K52,
@@ -124,12 +124,16 @@ define_smmu_vmsa_meta_16k!(SmmuVmsaMeta16K52, 52, 52, 5);
 define_smmu_vmsa_meta_64k!(SmmuVmsaMeta64K48, 48, 48, 6);
 define_smmu_vmsa_meta_64k!(SmmuVmsaMeta64K52, 52, 52, 10);
 
-pub type SmmuVmsaPageTable4K48<Alloc> = PageTable<SmmuVmsaMeta4K48, SmmuVmsaPte4K48, Alloc>;
-pub type SmmuVmsaPageTable4K52<Alloc> = PageTable<SmmuVmsaMeta4K52, SmmuVmsaPte4K52, Alloc>;
-pub type SmmuVmsaPageTable16K48<Alloc> = PageTable<SmmuVmsaMeta16K48, SmmuVmsaPte16K48, Alloc>;
-pub type SmmuVmsaPageTable16K52<Alloc> = PageTable<SmmuVmsaMeta16K52, SmmuVmsaPte16K52, Alloc>;
-pub type SmmuVmsaPageTable64K48<Alloc> = PageTable<SmmuVmsaMeta64K48, SmmuVmsaPte64K48, Alloc>;
-pub type SmmuVmsaPageTable64K52<Alloc> = PageTable<SmmuVmsaMeta64K52, SmmuVmsaPte64K52, Alloc>;
+pub type SmmuVmsaPageTable4K48<Alloc> = PageTableWalker<SmmuVmsaMeta4K48, SmmuVmsaPte4K48, Alloc>;
+pub type SmmuVmsaPageTable4K52<Alloc> = PageTableWalker<SmmuVmsaMeta4K52, SmmuVmsaPte4K52, Alloc>;
+pub type SmmuVmsaPageTable16K48<Alloc> =
+    PageTableWalker<SmmuVmsaMeta16K48, SmmuVmsaPte16K48, Alloc>;
+pub type SmmuVmsaPageTable16K52<Alloc> =
+    PageTableWalker<SmmuVmsaMeta16K52, SmmuVmsaPte16K52, Alloc>;
+pub type SmmuVmsaPageTable64K48<Alloc> =
+    PageTableWalker<SmmuVmsaMeta64K48, SmmuVmsaPte64K48, Alloc>;
+pub type SmmuVmsaPageTable64K52<Alloc> =
+    PageTableWalker<SmmuVmsaMeta64K52, SmmuVmsaPte64K52, Alloc>;
 
 #[cfg(test)]
 mod tests {

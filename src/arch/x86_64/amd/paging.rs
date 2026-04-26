@@ -5,8 +5,8 @@ use core::fmt;
 use memory_addr::PhysAddr;
 
 use crate::{
-    AccessFlags, CachePolicy, IoviAddr, MemoryAttributes, PageSize, PageTable, PageTableEntry,
-    PageTableEntryKind, PagingMetaData,
+    AccessFlags, CachePolicy, IoviAddr, MemoryAttributes, PageSize, PageTableEntry,
+    PageTableEntryKind, PageTableWalker, PagingMetaData,
 };
 
 const PRESENT: u64 = 1 << 0;
@@ -203,9 +203,9 @@ define_amd_vi_meta!(AmdViMeta39, 3, 39);
 define_amd_vi_meta!(AmdViMeta48, 4, 48);
 define_amd_vi_meta!(AmdViMeta57, 5, 57);
 
-pub type AmdViPageTable39<Alloc> = PageTable<AmdViMeta39, AmdViPte, Alloc>;
-pub type AmdViPageTable48<Alloc> = PageTable<AmdViMeta48, AmdViPte, Alloc>;
-pub type AmdViPageTable57<Alloc> = PageTable<AmdViMeta57, AmdViPte, Alloc>;
+pub type AmdViPageTable39<Alloc> = PageTableWalker<AmdViMeta39, AmdViPte, Alloc>;
+pub type AmdViPageTable48<Alloc> = PageTableWalker<AmdViMeta48, AmdViPte, Alloc>;
+pub type AmdViPageTable57<Alloc> = PageTableWalker<AmdViMeta57, AmdViPte, Alloc>;
 
 #[cfg(test)]
 mod tests {

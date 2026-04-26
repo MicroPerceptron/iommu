@@ -6,8 +6,9 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
 use kpte::{
-    AccessFlags, CachePolicy, FrameAllocator, MappingFlags, NoFlush, PageSize, PageTable,
-    PageTableEntry, PageTableEntryKind, PagingError, PagingMetaData, PagingResult, TlbInvalidation,
+    AccessFlags, CachePolicy, FrameAllocator, MappingFlags, NoFlush, PageSize, PageTableEntry,
+    PageTableEntryKind, PageTableWalker, PagingError, PagingMetaData, PagingResult,
+    TlbInvalidation,
 };
 use memory_addr::{PhysAddr, PhysAddrRange, VirtAddr, VirtAddrRange};
 
@@ -309,8 +310,8 @@ fn run_merge_2m((pt, range): &mut (BenchPt, VirtAddrRange)) {
     black_box(pt.merge_at(*range, &NO_FLUSH).unwrap());
 }
 
-type BenchPt = PageTable<BenchMeta, BenchPte, BenchAlloc>;
-type RecordingPt = PageTable<BenchMeta, BenchPte, BenchAlloc>;
+type BenchPt = PageTableWalker<BenchMeta, BenchPte, BenchAlloc>;
+type RecordingPt = PageTableWalker<BenchMeta, BenchPte, BenchAlloc>;
 
 const NO_FLUSH: NoFlush = NoFlush;
 const RECORDING_TLB: RecordingTlb = RecordingTlb;
