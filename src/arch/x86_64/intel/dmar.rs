@@ -26,6 +26,7 @@ const DMAR_ATSR: u16 = 2;
 const DMAR_RHSA: u16 = 3;
 const DMAR_ANDD: u16 = 4;
 const DMAR_SATC: u16 = 5;
+const DMAR_SIDP: u16 = 6;
 
 const DRHD_MIN_LENGTH: usize = 16;
 const RMRR_MIN_LENGTH: usize = 24;
@@ -33,6 +34,7 @@ const ATSR_MIN_LENGTH: usize = 8;
 const RHSA_MIN_LENGTH: usize = 20;
 const ANDD_MIN_LENGTH: usize = 8;
 const SATC_MIN_LENGTH: usize = 8;
+const SIDP_MIN_LENGTH: usize = 8;
 const DEVICE_SCOPE_HEADER_LENGTH: usize = 6;
 const VTD_REGISTER_WINDOW_SIZE: usize = 0x1000;
 
@@ -253,6 +255,27 @@ impl<'a> DmarTable<'a> {
         })
     }
 
+    pub fn for_each_sidp<F>(self, mut f: F) -> Result<(), DmarError>
+    where
+        F: FnMut(DmarSidp) -> Result<(), DmarError>,
+    {
+        self.for_each_structure(|structure| {
+            if let DmarStructure::Sidp(unit) = structure {
+                f(unit)?;
+            }
+            Ok(())
+        })
+    }
+
+    pub fn has_sidp(self) -> Result<bool, DmarError> {
+        let mut found = false;
+        self.for_each_sidp(|_| {
+            found = true;
+            Ok(())
+        })?;
+        Ok(found)
+    }
+
     pub fn for_each_drhd_device_scope<F>(self, unit: DmarDrhd, f: F) -> Result<(), DmarError>
     where
         F: FnMut(DmarDeviceScope<'a>) -> Result<(), DmarError>,
@@ -279,6 +302,13 @@ impl<'a> DmarTable<'a> {
         F: FnMut(DmarDeviceScope<'a>) -> Result<(), DmarError>,
     {
         self.walk_device_scopes(unit.structure_offset, SATC_MIN_LENGTH, unit.length, f)
+    }
+
+    pub fn for_each_sidp_device_scope<F>(self, unit: DmarSidp, f: F) -> Result<(), DmarError>
+    where
+        F: FnMut(DmarDeviceScope<'a>) -> Result<(), DmarError>,
+    {
+        self.walk_device_scopes(unit.structure_offset, SIDP_MIN_LENGTH, unit.length, f)
     }
 
     pub fn drhd_bdf_ranges(
@@ -420,6 +450,10 @@ impl<'a> DmarTable<'a> {
     }
 
     pub fn satc_device_ats_required(self, requester: PciDevice) -> Result<bool, DmarError> {
+        if self.has_sidp()? {
+            return Ok(false);
+        }
+
         let mut required = false;
         self.for_each_structure(|structure| {
             let DmarStructure::Satc(unit) = structure else {
@@ -499,6 +533,7 @@ impl<'a> DmarTable<'a> {
             DMAR_RHSA => Ok(DmarStructure::Rhsa(self.parse_rhsa(offset, length)?)),
             DMAR_ANDD => Ok(DmarStructure::Andd(self.parse_andd(offset, length)?)),
             DMAR_SATC => Ok(DmarStructure::Satc(self.parse_satc(offset, length)?)),
+            DMAR_SIDP => Ok(DmarStructure::Sidp(self.parse_sidp(offset, length)?)),
             other => Ok(DmarStructure::Unknown(DmarUnknown {
                 kind: other,
                 offset,
@@ -618,6 +653,20 @@ impl<'a> DmarTable<'a> {
         })
     }
 
+    fn parse_sidp(self, offset: usize, length: usize) -> Result<DmarSidp, DmarError> {
+        if length < SIDP_MIN_LENGTH {
+            return Err(DmarError::Malformed(
+                "DMAR SIDP structure shorter than minimum",
+            ));
+        }
+        Ok(DmarSidp {
+            segment: self.sdt.read_u16(offset + 6)?,
+            has_device_scopes: length > SIDP_MIN_LENGTH,
+            structure_offset: offset,
+            length,
+        })
+    }
+
     fn walk_device_scopes<F>(
         self,
         structure_offset: usize,
@@ -666,6 +715,7 @@ impl<'a> DmarTable<'a> {
 
             f(DmarDeviceScope {
                 kind: DmarDeviceScopeKind::from_raw(self.sdt.read_u8(scope_offset)?),
+                flags: self.sdt.read_u8(scope_offset + 2)?,
                 enumeration_id: self.sdt.read_u8(scope_offset + 4)?,
                 start_bus,
                 path,
@@ -732,6 +782,7 @@ pub enum DmarStructure<'a> {
     Rhsa(DmarRhsa),
     Andd(DmarAndd<'a>),
     Satc(DmarSatc),
+    Sidp(DmarSidp),
     Unknown(DmarUnknown),
 }
 
@@ -795,8 +846,17 @@ pub struct DmarSatc {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct DmarSidp {
+    pub segment: u16,
+    pub has_device_scopes: bool,
+    structure_offset: usize,
+    length: usize,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct DmarDeviceScope<'a> {
     pub kind: DmarDeviceScopeKind,
+    pub flags: u8,
     pub enumeration_id: u8,
     pub start_bus: u8,
     pub path: DmarDeviceScopePath<'a>,
@@ -1052,11 +1112,72 @@ mod tests {
             .unwrap();
         let scope = scope.unwrap();
         assert_eq!(scope.kind, super::DmarDeviceScopeKind::NamespaceDevice);
+        assert_eq!(scope.flags, 0);
         assert_eq!(scope.enumeration_id, 7);
         assert_eq!(scope.start_bus, 0x2a);
         assert_eq!(scope.path.depth(), 2);
         assert_eq!(scope.path.entry(0).unwrap().device, 0x1c);
         assert_eq!(scope.path.entry(1).unwrap().function, 1);
         assert_eq!(scope.requester, None);
+    }
+
+    #[test]
+    fn parses_sidp_and_ignores_satc_policy_when_present() {
+        let mut dmar = [0u8; 80];
+        write_sdt_header(&mut dmar, Signature::DMAR, 80);
+        dmar[36] = 47;
+
+        dmar[48..50].copy_from_slice(&5u16.to_le_bytes());
+        dmar[50..52].copy_from_slice(&16u16.to_le_bytes());
+        dmar[52] = 1;
+        dmar[54..56].copy_from_slice(&2u16.to_le_bytes());
+        dmar[56] = 1;
+        dmar[57] = 8;
+        dmar[61] = 0x2a;
+        dmar[62] = 5;
+        dmar[63] = 1;
+
+        dmar[64..66].copy_from_slice(&6u16.to_le_bytes());
+        dmar[66..68].copy_from_slice(&16u16.to_le_bytes());
+        dmar[70..72].copy_from_slice(&2u16.to_le_bytes());
+        dmar[72] = 1;
+        dmar[73] = 8;
+        dmar[74] = 0x81;
+        dmar[76] = 3;
+        dmar[77] = 0x2a;
+        dmar[78] = 5;
+        dmar[79] = 1;
+
+        let table = DmarTable::parse(&dmar).unwrap();
+        let structures: heapless::Vec<_, 2> = table.structures().collect::<Result<_, _>>().unwrap();
+        assert!(
+            matches!(structures.as_slice(), [DmarStructure::Satc(satc), DmarStructure::Sidp(sidp)]
+                if satc.segment == 2 && sidp.segment == 2 && sidp.has_device_scopes)
+        );
+        assert!(table.has_sidp().unwrap());
+        assert!(
+            !table
+                .satc_device_ats_required(PciDevice::new(2, 0x2a, 5, 1).unwrap())
+                .unwrap()
+        );
+
+        let DmarStructure::Sidp(sidp) = structures[1] else {
+            panic!("expected SIDP");
+        };
+        let mut scope = None;
+        table
+            .for_each_sidp_device_scope(sidp, |s| {
+                scope = Some(s);
+                Ok(())
+            })
+            .unwrap();
+        let scope = scope.unwrap();
+        assert_eq!(scope.kind, super::DmarDeviceScopeKind::Endpoint);
+        assert_eq!(scope.flags, 0x81);
+        assert_eq!(scope.enumeration_id, 3);
+        assert_eq!(
+            scope.requester,
+            Some(DmarBdfRange::single(Bdf::new(0x2a, 5, 1).unwrap()))
+        );
     }
 }
