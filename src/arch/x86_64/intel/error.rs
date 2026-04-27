@@ -11,6 +11,7 @@ pub enum VtdError {
     PageSelectiveInvalidationUnavailable,
     InvalidDomainId,
     InvalidSourceId,
+    RegisterTransitionTimeout,
 }
 
 impl From<VtdError> for Error {
@@ -22,6 +23,7 @@ impl From<VtdError> for Error {
             VtdError::PageSelectiveInvalidationUnavailable => Self::FeatureUnavailable,
             VtdError::InvalidDomainId => Self::InvalidAddressSpace,
             VtdError::InvalidSourceId => Self::InvalidClient,
+            VtdError::RegisterTransitionTimeout => Self::ControllerUnavailable,
         }
     }
 }

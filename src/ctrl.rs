@@ -212,13 +212,13 @@ impl<const N: usize> CommandQueue<N> {
         &self,
         bytes: [u8; W],
         read_head: RH,
-        write_tail: WT,
-        check_error: CE,
+        mut write_tail: WT,
+        mut check_error: CE,
     ) -> Result
     where
-        RH: Fn() -> usize,
-        WT: Fn(usize),
-        CE: Fn() -> Result,
+        RH: FnMut() -> Result<usize>,
+        WT: FnMut(usize),
+        CE: FnMut() -> Result,
     {
         let backing = self.backing.ok_or(Error::ControllerUnavailable)?;
         if W == 0 || !W.is_power_of_two() || W > backing.entry_bytes() {
@@ -281,12 +281,12 @@ impl<const N: usize> CommandQueue<N> {
     }
 
     #[inline]
-    fn wait_for_consumed<RH>(&self, slot: usize, entry_bytes: usize, read_head: RH) -> Result
+    fn wait_for_consumed<RH>(&self, slot: usize, entry_bytes: usize, mut read_head: RH) -> Result
     where
-        RH: Fn() -> usize,
+        RH: FnMut() -> Result<usize>,
     {
         for _ in 0..COMMAND_QUEUE_POLL_LIMIT {
-            let head_slot = read_head() / entry_bytes;
+            let head_slot = read_head()? / entry_bytes;
             if head_slot != slot {
                 return Ok(());
             }
@@ -528,12 +528,8 @@ pub trait Controller<V: MemoryAddr = IoviAddr>: PageTable<V> {
     fn unbind(&mut self, client: Self::Client, selector: BindingSelector) -> Result;
     fn invalidator(&self) -> &Self::Invalidator;
     fn invalidate(&mut self, request: Invalidate<Self::Client, V>) -> Result<InvalidateOutcome>;
-    fn configure_fault_event(&mut self, _config: FaultEventConfig) -> Result {
-        Err(Error::FeatureUnavailable)
-    }
-    fn poll_fault(&mut self) -> Result<Option<Self::Fault>> {
-        Err(Error::FeatureUnavailable)
-    }
+    fn configure_fault_event(&mut self, config: FaultEventConfig) -> Result;
+    fn poll_fault(&mut self) -> Result<Option<Self::Fault>>;
 }
 
 #[cfg(test)]
@@ -601,7 +597,7 @@ mod tests {
         queue
             .submit(
                 bytes,
-                || head.load(Ordering::Acquire),
+                || Ok(head.load(Ordering::Acquire)),
                 |new_tail| {
                     tail.store(new_tail, Ordering::Release);
                     head.store(new_tail, Ordering::Release);
@@ -626,7 +622,7 @@ mod tests {
             queue
                 .submit(
                     bytes,
-                    || head.load(Ordering::Acquire),
+                    || Ok(head.load(Ordering::Acquire)),
                     |new_tail| head.store(new_tail, Ordering::Release),
                     || Ok(()),
                 )

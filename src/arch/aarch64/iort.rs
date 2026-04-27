@@ -1,19 +1,17 @@
 //! ARM IORT firmware table parsing.
 
-use core::fmt;
+use core::{fmt, mem::size_of};
 
 use acpi::{
-    AcpiError, AcpiTable, Handler, PhysicalMapping,
+    AcpiError, AcpiTable,
     sdt::{SdtHeader, Signature},
 };
-use memory_addr::{PhysAddr, PhysAddrRange};
+use kore_memory::{Mapping, PageTableEntry, PagingError};
+use memory_addr::{MemoryAddr, PhysAddr, PhysAddrRange, VirtAddr};
 
 use crate::{
     MmioAddr, MmioAddrRange, MmioRange,
-    firm::{
-        acpi::{AcpiTableBytesError, SdtBytes},
-        pcie::{Bdf, BdfRange, BdfRangeSet, BdfRangeSetError, PciDevice},
-    },
+    firm::pcie::{Bdf, BdfRange, BdfRangeSet, BdfRangeSetError, PciDevice},
 };
 
 const IORT_NODE_COUNT_OFFSET: usize = 36;
@@ -47,8 +45,8 @@ pub type IortBdfRangeSet = BdfRangeSet<IORT_REQUESTER_WINDOW_CAPACITY>;
 #[derive(Clone, Debug)]
 pub enum IortError {
     Acpi(AcpiError),
-    Table(AcpiTableBytesError),
     BdfRanges(BdfRangeSetError),
+    Mapping(PagingError),
     Malformed(&'static str),
 }
 
@@ -59,13 +57,6 @@ impl From<AcpiError> for IortError {
     }
 }
 
-impl From<AcpiTableBytesError> for IortError {
-    #[inline]
-    fn from(value: AcpiTableBytesError) -> Self {
-        Self::Table(value)
-    }
-}
-
 impl From<BdfRangeSetError> for IortError {
     #[inline]
     fn from(value: BdfRangeSetError) -> Self {
@@ -73,12 +64,19 @@ impl From<BdfRangeSetError> for IortError {
     }
 }
 
+impl From<PagingError> for IortError {
+    #[inline]
+    fn from(value: PagingError) -> Self {
+        Self::Mapping(value)
+    }
+}
+
 impl fmt::Display for IortError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Acpi(error) => write!(f, "{error:?}"),
-            Self::Table(error) => write!(f, "{error}"),
             Self::BdfRanges(error) => write!(f, "{error}"),
+            Self::Mapping(error) => write!(f, "{error:?}"),
             Self::Malformed(message) => f.write_str(message),
         }
     }
@@ -133,47 +131,140 @@ unsafe impl AcpiTable for IortAcpiTable {
     }
 }
 
+fn table_bytes<'a, T: AcpiTable>(
+    bytes: &'a [u8],
+    short_header: &'static str,
+    short_table: &'static str,
+) -> Result<&'a [u8], IortError> {
+    if bytes.len() < size_of::<SdtHeader>() {
+        return Err(IortError::Malformed(short_header));
+    }
+
+    let header = unsafe { &*bytes.as_ptr().cast::<SdtHeader>() };
+    if header.signature != T::SIGNATURE {
+        return Err(IortError::Acpi(AcpiError::SdtInvalidSignature(
+            T::SIGNATURE,
+        )));
+    }
+
+    let length = header.length() as usize;
+    if length < size_of::<SdtHeader>() || length > bytes.len() {
+        return Err(IortError::Malformed(short_table));
+    }
+
+    unsafe { header.validate(T::SIGNATURE)? };
+    Ok(&bytes[..length])
+}
+
+unsafe fn from_mapping<Entry, P>(mapping: &Mapping<Entry, VirtAddr, P>) -> Result<&[u8], IortError>
+where
+    Entry: PageTableEntry,
+    P: MemoryAddr,
+{
+    let len = mapping.range.size();
+    let ptr = mapping.as_ptr_of::<u8>(0)?;
+    Ok(unsafe { core::slice::from_raw_parts(ptr, len) })
+}
+
+fn read_array<const N: usize>(
+    bytes: &[u8],
+    offset: usize,
+    message: &'static str,
+) -> Result<[u8; N], IortError> {
+    let end = offset
+        .checked_add(N)
+        .ok_or(IortError::Malformed("IORT read offset overflow"))?;
+    let bytes = bytes
+        .get(offset..end)
+        .ok_or(IortError::Malformed(message))?;
+    let mut out = [0; N];
+    out.copy_from_slice(bytes);
+    Ok(out)
+}
+
+#[inline]
+fn read_u8(bytes: &[u8], offset: usize) -> Result<u8, IortError> {
+    bytes
+        .get(offset)
+        .copied()
+        .ok_or(IortError::Malformed("IORT table read is out of bounds"))
+}
+
+#[inline]
+fn read_u16(bytes: &[u8], offset: usize) -> Result<u16, IortError> {
+    Ok(u16::from_le_bytes(read_array(
+        bytes,
+        offset,
+        "IORT table read is out of bounds",
+    )?))
+}
+
+#[inline]
+fn read_u32(bytes: &[u8], offset: usize) -> Result<u32, IortError> {
+    Ok(u32::from_le_bytes(read_array(
+        bytes,
+        offset,
+        "IORT table read is out of bounds",
+    )?))
+}
+
+#[inline]
+fn read_u64(bytes: &[u8], offset: usize) -> Result<u64, IortError> {
+    Ok(u64::from_le_bytes(read_array(
+        bytes,
+        offset,
+        "IORT table read is out of bounds",
+    )?))
+}
+
 #[derive(Clone, Copy, Debug)]
 pub struct IortTable<'a> {
-    sdt: SdtBytes<'a>,
+    sdt: &'a [u8],
 }
 
 impl<'a> IortTable<'a> {
-    pub fn parse(bytes: &'a [u8]) -> Result<Self, IortError> {
-        let sdt = SdtBytes::new_for::<IortAcpiTable>(bytes)?;
+    fn parse(bytes: &'a [u8]) -> Result<Self, IortError> {
+        let sdt = table_bytes::<IortAcpiTable>(
+            bytes,
+            "IORT table shorter than SDT header",
+            "IORT table length is invalid",
+        )?;
         if sdt.len() < IORT_TABLE_MIN_LENGTH {
             return Err(IortError::Malformed("IORT table shorter than fixed header"));
         }
         Ok(Self { sdt })
     }
 
-    pub fn from_acpi_mapping<H>(
-        mapping: &'a PhysicalMapping<H, IortAcpiTable>,
+    /// Parse an IORT table from an already-readable `kore_memory` mapping.
+    ///
+    /// # Safety
+    ///
+    /// `mapping` must remain live and readable for the returned table's
+    /// lifetime, and its virtual range must cover the complete ACPI table.
+    pub unsafe fn from_mapping<Entry, P>(
+        mapping: &'a Mapping<Entry, VirtAddr, P>,
     ) -> Result<Self, IortError>
     where
-        H: Handler,
+        Entry: PageTableEntry,
+        P: MemoryAddr,
     {
-        mapping.validate()?;
-        let sdt = SdtBytes::from_mapping(mapping)?;
-        if sdt.len() < IORT_TABLE_MIN_LENGTH {
-            return Err(IortError::Malformed("IORT table shorter than fixed header"));
-        }
-        Ok(Self { sdt })
+        let bytes = unsafe { from_mapping(mapping)? };
+        Self::parse(bytes)
     }
 
     #[inline]
     pub const fn bytes(self) -> &'a [u8] {
-        self.sdt.bytes()
+        self.sdt
     }
 
     #[inline]
     pub fn node_count(self) -> Result<u32, IortError> {
-        Ok(self.sdt.read_u32(IORT_NODE_COUNT_OFFSET)?)
+        read_u32(self.sdt, IORT_NODE_COUNT_OFFSET)
     }
 
     #[inline]
     pub fn node_offset(self) -> Result<u32, IortError> {
-        Ok(self.sdt.read_u32(IORT_NODE_OFFSET_OFFSET)?)
+        read_u32(self.sdt, IORT_NODE_OFFSET_OFFSET)
     }
 
     pub fn nodes(self) -> Result<IortNodes<'a>, IortError> {
@@ -292,10 +383,10 @@ impl<'a> IortTable<'a> {
             ));
         }
         Ok(Some(IortSmmuGlobalInterrupt {
-            nsg_irpt: self.sdt.read_u32(offset)?,
-            nsg_irpt_flags: self.sdt.read_u32(offset + 4)?,
-            nsg_cfg_irpt: self.sdt.read_u32(offset + 8)?,
-            nsg_cfg_irpt_flags: self.sdt.read_u32(offset + 12)?,
+            nsg_irpt: read_u32(self.sdt, offset)?,
+            nsg_irpt_flags: read_u32(self.sdt, offset + 4)?,
+            nsg_cfg_irpt: read_u32(self.sdt, offset + 8)?,
+            nsg_cfg_irpt_flags: read_u32(self.sdt, offset + 12)?,
         }))
     }
 
@@ -554,7 +645,7 @@ impl<'a> IortTable<'a> {
         if checked_offset(offset, IORT_NODE_HEADER_LENGTH)? > self.sdt.len() {
             return Err(IortError::Malformed("IORT node truncated before header"));
         }
-        let length = usize::from(self.sdt.read_u16(offset + 1)?);
+        let length = usize::from(read_u16(self.sdt, offset + 1)?);
         if length < IORT_NODE_HEADER_LENGTH {
             return Err(IortError::Malformed("IORT node length smaller than header"));
         }
@@ -563,11 +654,11 @@ impl<'a> IortTable<'a> {
         }
 
         Ok(IortNodeHeader {
-            kind: IortNodeKind::from_raw(self.sdt.read_u8(offset)?),
-            revision: self.sdt.read_u8(offset + 3)?,
-            identifier: self.sdt.read_u32(offset + 4)?,
-            mapping_count: self.sdt.read_u32(offset + 8)?,
-            mapping_offset: self.sdt.read_u32(offset + 12)?,
+            kind: IortNodeKind::from_raw(read_u8(self.sdt, offset)?),
+            revision: read_u8(self.sdt, offset + 3)?,
+            identifier: read_u32(self.sdt, offset + 4)?,
+            mapping_count: read_u32(self.sdt, offset + 8)?,
+            mapping_offset: read_u32(self.sdt, offset + 12)?,
             offset,
             length,
         })
@@ -580,7 +671,7 @@ impl<'a> IortTable<'a> {
             ));
         }
         Ok(IortItsGroup {
-            its_count: self.sdt.read_u32(header.offset + 16)?,
+            its_count: read_u32(self.sdt, header.offset + 16)?,
             header,
         })
     }
@@ -607,10 +698,10 @@ impl<'a> IortTable<'a> {
         }
 
         Ok(IortNamedComponent {
-            node_flags: self.sdt.read_u32(header.offset + 16)?,
+            node_flags: read_u32(self.sdt, header.offset + 16)?,
             memory_properties: self.read_memory_access(header.offset + 20)?,
-            memory_address_limit: self.sdt.read_u8(header.offset + 28)?,
-            device_name: &self.sdt.bytes()[name_start..name_end],
+            memory_address_limit: read_u8(self.sdt, header.offset + 28)?,
+            device_name: &self.sdt[name_start..name_end],
             header,
         })
     }
@@ -623,10 +714,10 @@ impl<'a> IortTable<'a> {
         }
         Ok(IortRootComplex {
             memory_properties: self.read_memory_access(header.offset + 16)?,
-            ats_attribute: self.sdt.read_u32(header.offset + 24)?,
-            pci_segment_number: self.sdt.read_u32(header.offset + 28)?,
-            memory_address_limit: self.sdt.read_u8(header.offset + 32)?,
-            pasid_capabilities: self.sdt.read_u16(header.offset + 33)?,
+            ats_attribute: read_u32(self.sdt, header.offset + 24)?,
+            pci_segment_number: read_u32(self.sdt, header.offset + 28)?,
+            memory_address_limit: read_u8(self.sdt, header.offset + 32)?,
+            pasid_capabilities: read_u16(self.sdt, header.offset + 33)?,
             header,
         })
     }
@@ -637,16 +728,16 @@ impl<'a> IortTable<'a> {
         }
         Ok(IortSmmu {
             registers: mmio_range_from_start_size(
-                self.sdt.read_u64(header.offset + 16)?,
-                self.sdt.read_u64(header.offset + 24)?,
+                read_u64(self.sdt, header.offset + 16)?,
+                read_u64(self.sdt, header.offset + 24)?,
             )?,
-            model: self.sdt.read_u32(header.offset + 32)?,
-            flags: self.sdt.read_u32(header.offset + 36)?,
-            global_interrupt_offset: self.sdt.read_u32(header.offset + 40)?,
-            context_interrupt_count: self.sdt.read_u32(header.offset + 44)?,
-            context_interrupt_offset: self.sdt.read_u32(header.offset + 48)?,
-            pmu_interrupt_count: self.sdt.read_u32(header.offset + 52)?,
-            pmu_interrupt_offset: self.sdt.read_u32(header.offset + 56)?,
+            model: read_u32(self.sdt, header.offset + 32)?,
+            flags: read_u32(self.sdt, header.offset + 36)?,
+            global_interrupt_offset: read_u32(self.sdt, header.offset + 40)?,
+            context_interrupt_count: read_u32(self.sdt, header.offset + 44)?,
+            context_interrupt_offset: read_u32(self.sdt, header.offset + 48)?,
+            pmu_interrupt_count: read_u32(self.sdt, header.offset + 52)?,
+            pmu_interrupt_offset: read_u32(self.sdt, header.offset + 56)?,
             header,
         })
     }
@@ -657,22 +748,22 @@ impl<'a> IortTable<'a> {
                 "IORT SMMUv3 node shorter than minimum",
             ));
         }
-        let vatos_address = self.sdt.read_u64(header.offset + 32)?;
+        let vatos_address = read_u64(self.sdt, header.offset + 32)?;
         Ok(IortSmmuV3 {
-            base_address: mmio_address(self.sdt.read_u64(header.offset + 16)?)?,
-            flags: self.sdt.read_u32(header.offset + 24)?,
+            base_address: mmio_address(read_u64(self.sdt, header.offset + 16)?)?,
+            flags: read_u32(self.sdt, header.offset + 24)?,
             vatos_address: if vatos_address == 0 {
                 None
             } else {
                 Some(mmio_address(vatos_address)?)
             },
-            model: self.sdt.read_u32(header.offset + 40)?,
-            event_gsiv: self.sdt.read_u32(header.offset + 44)?,
-            pri_gsiv: self.sdt.read_u32(header.offset + 48)?,
-            gerr_gsiv: self.sdt.read_u32(header.offset + 52)?,
-            sync_gsiv: self.sdt.read_u32(header.offset + 56)?,
-            pxm: self.sdt.read_u32(header.offset + 60)?,
-            id_mapping_index: self.sdt.read_u32(header.offset + 64)?,
+            model: read_u32(self.sdt, header.offset + 40)?,
+            event_gsiv: read_u32(self.sdt, header.offset + 44)?,
+            pri_gsiv: read_u32(self.sdt, header.offset + 48)?,
+            gerr_gsiv: read_u32(self.sdt, header.offset + 52)?,
+            sync_gsiv: read_u32(self.sdt, header.offset + 56)?,
+            pxm: read_u32(self.sdt, header.offset + 60)?,
+            id_mapping_index: read_u32(self.sdt, header.offset + 64)?,
             header,
         })
     }
@@ -681,11 +772,11 @@ impl<'a> IortTable<'a> {
         if header.length < PMCG_MIN_LENGTH {
             return Err(IortError::Malformed("IORT PMCG node shorter than minimum"));
         }
-        let page1 = self.sdt.read_u64(header.offset + 32)?;
+        let page1 = read_u64(self.sdt, header.offset + 32)?;
         Ok(IortPmcg {
-            page0_base_address: mmio_address(self.sdt.read_u64(header.offset + 16)?)?,
-            overflow_gsiv: self.sdt.read_u32(header.offset + 24)?,
-            node_reference: self.sdt.read_u32(header.offset + 28)?,
+            page0_base_address: mmio_address(read_u64(self.sdt, header.offset + 16)?)?,
+            overflow_gsiv: read_u32(self.sdt, header.offset + 24)?,
+            node_reference: read_u32(self.sdt, header.offset + 28)?,
             page1_base_address: if page1 == 0 {
                 None
             } else {
@@ -703,9 +794,9 @@ impl<'a> IortTable<'a> {
             return Err(IortError::Malformed("IORT RMR node shorter than minimum"));
         }
         Ok(IortReservedMemory {
-            flags: self.sdt.read_u32(header.offset + 16)?,
-            descriptor_count: self.sdt.read_u32(header.offset + 20)?,
-            descriptor_offset: self.sdt.read_u32(header.offset + 24)?,
+            flags: read_u32(self.sdt, header.offset + 16)?,
+            descriptor_count: read_u32(self.sdt, header.offset + 20)?,
+            descriptor_offset: read_u32(self.sdt, header.offset + 24)?,
             header,
         })
     }
@@ -778,9 +869,9 @@ impl<'a> IortTable<'a> {
 
     fn read_memory_access(self, offset: usize) -> Result<IortMemoryAccess, IortError> {
         Ok(IortMemoryAccess {
-            cache_coherency: self.sdt.read_u32(offset)?,
-            hints: self.sdt.read_u8(offset + 4)?,
-            memory_flags: self.sdt.read_u8(offset + 7)?,
+            cache_coherency: read_u32(self.sdt, offset)?,
+            hints: read_u8(self.sdt, offset + 4)?,
+            memory_flags: read_u8(self.sdt, offset + 7)?,
         })
     }
 }
@@ -806,7 +897,7 @@ impl<'a> Iterator for IortNodes<'a> {
         }
 
         let offset = self.offset;
-        let length = match self.table.sdt.read_u16(offset + 1) {
+        let length = match read_u16(self.table.sdt, offset + 1) {
             Ok(length) => usize::from(length),
             Err(error) => {
                 self.remaining = 0;
@@ -1024,13 +1115,13 @@ impl Iterator for IortIdMappings<'_> {
         self.offset += IORT_ID_MAPPING_LENGTH;
         self.remaining -= 1;
         Some(
-            (|| -> Result<IortIdMapping, AcpiTableBytesError> {
+            (|| -> Result<IortIdMapping, IortError> {
                 Ok(IortIdMapping {
-                    input_base: self.table.sdt.read_u32(offset)?,
-                    id_count: self.table.sdt.read_u32(offset + 4)?,
-                    output_base: self.table.sdt.read_u32(offset + 8)?,
-                    output_reference: self.table.sdt.read_u32(offset + 12)?,
-                    flags: self.table.sdt.read_u32(offset + 16)?,
+                    input_base: read_u32(self.table.sdt, offset)?,
+                    id_count: read_u32(self.table.sdt, offset + 4)?,
+                    output_base: read_u32(self.table.sdt, offset + 8)?,
+                    output_reference: read_u32(self.table.sdt, offset + 12)?,
+                    flags: read_u32(self.table.sdt, offset + 16)?,
                 })
             })()
             .map_err(IortError::from),
@@ -1066,9 +1157,9 @@ impl Iterator for IortItsIdentifiers<'_> {
         self.offset += 4;
         self.remaining -= 1;
         Some(
-            (|| -> Result<IortItsIdentifier, AcpiTableBytesError> {
+            (|| -> Result<IortItsIdentifier, IortError> {
                 Ok(IortItsIdentifier {
-                    identifier: self.table.sdt.read_u32(offset)?,
+                    identifier: read_u32(self.table.sdt, offset)?,
                 })
             })()
             .map_err(IortError::from),
@@ -1161,10 +1252,10 @@ impl Iterator for IortSmmuInterrupts<'_> {
         self.offset += 8;
         self.remaining -= 1;
         Some(
-            (|| -> Result<IortSmmuInterrupt, AcpiTableBytesError> {
+            (|| -> Result<IortSmmuInterrupt, IortError> {
                 Ok(IortSmmuInterrupt {
-                    gsiv: self.table.sdt.read_u32(offset)?,
-                    flags: self.table.sdt.read_u32(offset + 4)?,
+                    gsiv: read_u32(self.table.sdt, offset)?,
+                    flags: read_u32(self.table.sdt, offset + 4)?,
                 })
             })()
             .map_err(IortError::from),
@@ -1256,11 +1347,11 @@ impl Iterator for IortRmrDescriptors<'_> {
         self.offset += RMR_DESCRIPTOR_LENGTH;
         self.remaining -= 1;
         Some((|| {
-            let base = self.table.sdt.read_u64(offset)?;
-            let length = self.table.sdt.read_u64(offset + 8)?;
+            let base = read_u64(self.table.sdt, offset)?;
+            let length = read_u64(self.table.sdt, offset + 8)?;
             Ok(IortRmrDescriptor {
                 memory: phys_range_from_start_size(base, length)?,
-                reserved: self.table.sdt.read_u32(offset + 16)?,
+                reserved: read_u32(self.table.sdt, offset + 16)?,
             })
         })())
     }
@@ -1273,11 +1364,70 @@ mod tests {
     };
     use crate::firm::pcie::{Bdf, BdfRange, PciDevice};
     use acpi::sdt::Signature;
+    use kore_memory::{Mapping, PageSize, PageTableEntry, PageTableEntryKind};
+    use memory_addr::{PhysAddr, VirtAddr, VirtAddrRange};
+
+    #[derive(Clone, Copy, Debug)]
+    struct TestEntry;
+
+    impl PageTableEntry for TestEntry {
+        type Flags = ();
+
+        fn new_leaf(_paddr: PhysAddr, _flags: Self::Flags, _size: PageSize) -> Self {
+            Self
+        }
+
+        fn new_table(_paddr: PhysAddr, _level: u8) -> Self {
+            Self
+        }
+
+        fn paddr(&self) -> PhysAddr {
+            PhysAddr::from_usize(0)
+        }
+
+        fn flags(&self) -> Self::Flags {}
+
+        fn is_present(&self) -> bool {
+            true
+        }
+
+        fn entry_kind(&self, _level: u8) -> PageTableEntryKind {
+            PageTableEntryKind::Leaf
+        }
+
+        fn clear(&mut self) {}
+
+        fn bits(&self) -> u64 {
+            0
+        }
+
+        fn from_bits(_bits: u64) -> Self {
+            Self
+        }
+    }
 
     fn write_sdt_header(bytes: &mut [u8], signature: Signature, length: usize) {
         bytes[0..4].copy_from_slice(signature.as_str().as_bytes());
         bytes[4..8].copy_from_slice(&(length as u32).to_le_bytes());
         bytes[8] = 1;
+    }
+
+    fn finish_sdt_checksum(bytes: &mut [u8]) {
+        bytes[9] = 0;
+        bytes[9] = 0u8.wrapping_sub(
+            bytes
+                .iter()
+                .fold(0, |sum: u8, byte| sum.wrapping_add(*byte)),
+        );
+    }
+
+    fn table_mapping(bytes: &[u8]) -> Mapping<TestEntry, VirtAddr> {
+        let start = VirtAddr::from_usize(bytes.as_ptr() as usize);
+        Mapping::new(
+            VirtAddrRange::from_start_size(start, bytes.len()),
+            PhysAddr::from_usize(0),
+            (),
+        )
     }
 
     fn write_node_header(
@@ -1362,7 +1512,10 @@ mod tests {
         iort[SMMU + 60..SMMU + 64].copy_from_slice(&9u32.to_le_bytes());
         iort[SMMU + 64..SMMU + 68].copy_from_slice(&0u32.to_le_bytes());
 
-        let table = IortTable::parse(&iort).unwrap();
+        finish_sdt_checksum(&mut iort);
+
+        let mapping = table_mapping(&iort);
+        let table = unsafe { IortTable::from_mapping(&mapping) }.unwrap();
         let nodes: heapless::Vec<_, 4> = table.nodes().unwrap().collect::<Result<_, _>>().unwrap();
         assert!(matches!(
             nodes[0],
@@ -1455,7 +1608,10 @@ mod tests {
         iort[RMR + 36..RMR + 44].copy_from_slice(&0x1000u64.to_le_bytes());
         write_id_mapping(&mut iort, RMR + 48, 0x200, 0, 0x200, ITS as u32, 0);
 
-        let table = IortTable::parse(&iort).unwrap();
+        finish_sdt_checksum(&mut iort);
+
+        let mapping = table_mapping(&iort);
+        let table = unsafe { IortTable::from_mapping(&mapping) }.unwrap();
         let nodes: heapless::Vec<_, 4> = table.nodes().unwrap().collect::<Result<_, _>>().unwrap();
         assert!(matches!(nodes[0].header().kind, IortNodeKind::ItsGroup));
 

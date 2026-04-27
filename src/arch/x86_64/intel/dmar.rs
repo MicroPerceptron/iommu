@@ -1,19 +1,17 @@
 //! Intel VT-d DMAR firmware table parsing.
 
-use core::fmt;
+use core::{fmt, mem::size_of};
 
 use acpi::{
-    AcpiError, AcpiTable, Handler, PhysicalMapping,
+    AcpiError, AcpiTable,
     sdt::{SdtHeader, Signature},
 };
-use memory_addr::{PhysAddr, PhysAddrRange};
+use kore_memory::{Mapping, PageTableEntry, PagingError};
+use memory_addr::{MemoryAddr, PhysAddr, PhysAddrRange, VirtAddr};
 
 use crate::{
     MmioAddr, MmioAddrRange, MmioRange,
-    firm::{
-        acpi::{AcpiTableBytesError, SdtBytes},
-        pcie::{Bdf, BdfRange, BdfRangeSet, BdfRangeSetError, PciDevice},
-    },
+    firm::pcie::{Bdf, BdfRange, BdfRangeSet, BdfRangeSetError, PciDevice},
 };
 
 const DMAR_HOST_ADDRESS_WIDTH_OFFSET: usize = 36;
@@ -51,8 +49,8 @@ pub type DmarBdfRangeSet = BdfRangeSet<DMAR_REQUESTER_WINDOW_CAPACITY>;
 #[derive(Clone, Debug)]
 pub enum DmarError {
     Acpi(AcpiError),
-    Table(AcpiTableBytesError),
     BdfRanges(BdfRangeSetError),
+    Mapping(PagingError),
     Malformed(&'static str),
 }
 
@@ -63,13 +61,6 @@ impl From<AcpiError> for DmarError {
     }
 }
 
-impl From<AcpiTableBytesError> for DmarError {
-    #[inline]
-    fn from(value: AcpiTableBytesError) -> Self {
-        Self::Table(value)
-    }
-}
-
 impl From<BdfRangeSetError> for DmarError {
     #[inline]
     fn from(value: BdfRangeSetError) -> Self {
@@ -77,12 +68,19 @@ impl From<BdfRangeSetError> for DmarError {
     }
 }
 
+impl From<PagingError> for DmarError {
+    #[inline]
+    fn from(value: PagingError) -> Self {
+        Self::Mapping(value)
+    }
+}
+
 impl fmt::Display for DmarError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Acpi(error) => write!(f, "{error:?}"),
-            Self::Table(error) => write!(f, "{error}"),
             Self::BdfRanges(error) => write!(f, "{error}"),
+            Self::Mapping(error) => write!(f, "{error:?}"),
             Self::Malformed(message) => f.write_str(message),
         }
     }
@@ -131,47 +129,140 @@ unsafe impl AcpiTable for DmarAcpiTable {
     }
 }
 
+fn table_bytes<'a, T: AcpiTable>(
+    bytes: &'a [u8],
+    short_header: &'static str,
+    short_table: &'static str,
+) -> Result<&'a [u8], DmarError> {
+    if bytes.len() < size_of::<SdtHeader>() {
+        return Err(DmarError::Malformed(short_header));
+    }
+
+    let header = unsafe { &*bytes.as_ptr().cast::<SdtHeader>() };
+    if header.signature != T::SIGNATURE {
+        return Err(DmarError::Acpi(AcpiError::SdtInvalidSignature(
+            T::SIGNATURE,
+        )));
+    }
+
+    let length = header.length() as usize;
+    if length < size_of::<SdtHeader>() || length > bytes.len() {
+        return Err(DmarError::Malformed(short_table));
+    }
+
+    unsafe { header.validate(T::SIGNATURE)? };
+    Ok(&bytes[..length])
+}
+
+unsafe fn from_mapping<Entry, P>(mapping: &Mapping<Entry, VirtAddr, P>) -> Result<&[u8], DmarError>
+where
+    Entry: PageTableEntry,
+    P: MemoryAddr,
+{
+    let len = mapping.range.size();
+    let ptr = mapping.as_ptr_of::<u8>(0)?;
+    Ok(unsafe { core::slice::from_raw_parts(ptr, len) })
+}
+
+fn read_array<const N: usize>(
+    bytes: &[u8],
+    offset: usize,
+    message: &'static str,
+) -> Result<[u8; N], DmarError> {
+    let end = offset
+        .checked_add(N)
+        .ok_or(DmarError::Malformed("DMAR read offset overflow"))?;
+    let bytes = bytes
+        .get(offset..end)
+        .ok_or(DmarError::Malformed(message))?;
+    let mut out = [0; N];
+    out.copy_from_slice(bytes);
+    Ok(out)
+}
+
+#[inline]
+fn read_u8(bytes: &[u8], offset: usize) -> Result<u8, DmarError> {
+    bytes
+        .get(offset)
+        .copied()
+        .ok_or(DmarError::Malformed("DMAR table read is out of bounds"))
+}
+
+#[inline]
+fn read_u16(bytes: &[u8], offset: usize) -> Result<u16, DmarError> {
+    Ok(u16::from_le_bytes(read_array(
+        bytes,
+        offset,
+        "DMAR table read is out of bounds",
+    )?))
+}
+
+#[inline]
+fn read_u32(bytes: &[u8], offset: usize) -> Result<u32, DmarError> {
+    Ok(u32::from_le_bytes(read_array(
+        bytes,
+        offset,
+        "DMAR table read is out of bounds",
+    )?))
+}
+
+#[inline]
+fn read_u64(bytes: &[u8], offset: usize) -> Result<u64, DmarError> {
+    Ok(u64::from_le_bytes(read_array(
+        bytes,
+        offset,
+        "DMAR table read is out of bounds",
+    )?))
+}
+
 #[derive(Clone, Copy, Debug)]
 pub struct DmarTable<'a> {
-    sdt: SdtBytes<'a>,
+    sdt: &'a [u8],
 }
 
 impl<'a> DmarTable<'a> {
-    pub fn parse(bytes: &'a [u8]) -> Result<Self, DmarError> {
-        let sdt = SdtBytes::new_for::<DmarAcpiTable>(bytes)?;
+    fn parse(bytes: &'a [u8]) -> Result<Self, DmarError> {
+        let sdt = table_bytes::<DmarAcpiTable>(
+            bytes,
+            "DMAR table shorter than SDT header",
+            "DMAR table length is invalid",
+        )?;
         if sdt.len() < DMAR_STRUCTURES_OFFSET {
             return Err(DmarError::Malformed("DMAR table shorter than fixed header"));
         }
         Ok(Self { sdt })
     }
 
-    pub fn from_acpi_mapping<H>(
-        mapping: &'a PhysicalMapping<H, DmarAcpiTable>,
+    /// Parse a DMAR table from an already-readable `kore_memory` mapping.
+    ///
+    /// # Safety
+    ///
+    /// `mapping` must remain live and readable for the returned table's
+    /// lifetime, and its virtual range must cover the complete ACPI table.
+    pub unsafe fn from_mapping<Entry, P>(
+        mapping: &'a Mapping<Entry, VirtAddr, P>,
     ) -> Result<Self, DmarError>
     where
-        H: Handler,
+        Entry: PageTableEntry,
+        P: MemoryAddr,
     {
-        mapping.validate()?;
-        let sdt = SdtBytes::from_mapping(mapping)?;
-        if sdt.len() < DMAR_STRUCTURES_OFFSET {
-            return Err(DmarError::Malformed("DMAR table shorter than fixed header"));
-        }
-        Ok(Self { sdt })
+        let bytes = unsafe { from_mapping(mapping)? };
+        Self::parse(bytes)
     }
 
     #[inline]
     pub const fn bytes(self) -> &'a [u8] {
-        self.sdt.bytes()
+        self.sdt
     }
 
     #[inline]
     pub fn host_address_width(self) -> Result<u8, DmarError> {
-        Ok(self.sdt.read_u8(DMAR_HOST_ADDRESS_WIDTH_OFFSET)?)
+        read_u8(self.sdt, DMAR_HOST_ADDRESS_WIDTH_OFFSET)
     }
 
     #[inline]
     pub fn flags(self) -> Result<u8, DmarError> {
-        Ok(self.sdt.read_u8(DMAR_FLAGS_OFFSET)?)
+        read_u8(self.sdt, DMAR_FLAGS_OFFSET)
     }
 
     #[inline]
@@ -548,12 +639,12 @@ impl<'a> DmarTable<'a> {
                 "DMAR DRHD structure shorter than minimum",
             ));
         }
-        let flags = self.sdt.read_u8(offset + 4)?;
+        let flags = read_u8(self.sdt, offset + 4)?;
         Ok(DmarDrhd {
             flags,
-            segment: self.sdt.read_u16(offset + 6)?,
+            segment: read_u16(self.sdt, offset + 6)?,
             registers: mmio_register_window(
-                self.sdt.read_u64(offset + 8)?,
+                read_u64(self.sdt, offset + 8)?,
                 VTD_REGISTER_WINDOW_SIZE,
                 "DMAR DRHD register base cannot fit in usize",
                 "DMAR DRHD register window overflows",
@@ -572,8 +663,8 @@ impl<'a> DmarTable<'a> {
             ));
         }
         Ok(DmarAndd {
-            acpi_device_number: self.sdt.read_u8(offset + 7)?,
-            object_name: &self.sdt.bytes()[offset + ANDD_MIN_LENGTH..offset + length],
+            acpi_device_number: read_u8(self.sdt, offset + 7)?,
+            object_name: &self.sdt[offset + ANDD_MIN_LENGTH..offset + length],
         })
     }
 
@@ -583,13 +674,13 @@ impl<'a> DmarTable<'a> {
                 "DMAR RMRR structure shorter than minimum",
             ));
         }
-        let base = self.sdt.read_u64(offset + 8)?;
-        let limit = self.sdt.read_u64(offset + 16)?;
+        let base = read_u64(self.sdt, offset + 8)?;
+        let limit = read_u64(self.sdt, offset + 16)?;
         if limit < base {
             return Err(DmarError::Malformed("DMAR RMRR limit smaller than base"));
         }
         Ok(DmarRmrr {
-            segment: self.sdt.read_u16(offset + 6)?,
+            segment: read_u16(self.sdt, offset + 6)?,
             memory: inclusive_phys_range(
                 base,
                 limit,
@@ -608,10 +699,10 @@ impl<'a> DmarTable<'a> {
                 "DMAR ATSR structure shorter than minimum",
             ));
         }
-        let flags = self.sdt.read_u8(offset + 4)?;
+        let flags = read_u8(self.sdt, offset + 4)?;
         Ok(DmarAtsr {
             flags,
-            segment: self.sdt.read_u16(offset + 6)?,
+            segment: read_u16(self.sdt, offset + 6)?,
             include_all: (flags & 0x01) != 0,
             has_device_scopes: length > ATSR_MIN_LENGTH,
             structure_offset: offset,
@@ -627,12 +718,12 @@ impl<'a> DmarTable<'a> {
         }
         Ok(DmarRhsa {
             registers: mmio_register_window(
-                self.sdt.read_u64(offset + 8)?,
+                read_u64(self.sdt, offset + 8)?,
                 VTD_REGISTER_WINDOW_SIZE,
                 "DMAR RHSA register base cannot fit in usize",
                 "DMAR RHSA register window overflows",
             )?,
-            proximity_domain: self.sdt.read_u32(offset + 16)?,
+            proximity_domain: read_u32(self.sdt, offset + 16)?,
         })
     }
 
@@ -642,10 +733,10 @@ impl<'a> DmarTable<'a> {
                 "DMAR SATC structure shorter than minimum",
             ));
         }
-        let flags = self.sdt.read_u8(offset + 4)?;
+        let flags = read_u8(self.sdt, offset + 4)?;
         Ok(DmarSatc {
             flags,
-            segment: self.sdt.read_u16(offset + 6)?,
+            segment: read_u16(self.sdt, offset + 6)?,
             atc_required: (flags & 0x01) != 0,
             has_device_scopes: length > SATC_MIN_LENGTH,
             structure_offset: offset,
@@ -660,7 +751,7 @@ impl<'a> DmarTable<'a> {
             ));
         }
         Ok(DmarSidp {
-            segment: self.sdt.read_u16(offset + 6)?,
+            segment: read_u16(self.sdt, offset + 6)?,
             has_device_scopes: length > SIDP_MIN_LENGTH,
             structure_offset: offset,
             length,
@@ -686,7 +777,7 @@ impl<'a> DmarTable<'a> {
             }
 
             let scope_offset = structure_offset + offset;
-            let scope_length = usize::from(self.sdt.read_u8(scope_offset + 1)?);
+            let scope_length = usize::from(read_u8(self.sdt, scope_offset + 1)?);
             if scope_length < DEVICE_SCOPE_HEADER_LENGTH {
                 return Err(DmarError::Malformed(
                     "DMAR device scope shorter than minimum",
@@ -705,18 +796,18 @@ impl<'a> DmarTable<'a> {
                 ));
             }
 
-            let start_bus = self.sdt.read_u8(scope_offset + 5)?;
+            let start_bus = read_u8(self.sdt, scope_offset + 5)?;
             let path_start = scope_offset + DEVICE_SCOPE_HEADER_LENGTH;
             let path_end = scope_offset + scope_length;
             let path = DmarDeviceScopePath {
-                bytes: &self.sdt.bytes()[path_start..path_end],
+                bytes: &self.sdt[path_start..path_end],
             };
             let requester = path.single_requester(start_bus).ok().map(BdfRange::single);
 
             f(DmarDeviceScope {
-                kind: DmarDeviceScopeKind::from_raw(self.sdt.read_u8(scope_offset)?),
-                flags: self.sdt.read_u8(scope_offset + 2)?,
-                enumeration_id: self.sdt.read_u8(scope_offset + 4)?,
+                kind: DmarDeviceScopeKind::from_raw(read_u8(self.sdt, scope_offset)?),
+                flags: read_u8(self.sdt, scope_offset + 2)?,
+                enumeration_id: read_u8(self.sdt, scope_offset + 4)?,
                 start_bus,
                 path,
                 requester,
@@ -748,11 +839,11 @@ impl<'a> Iterator for DmarStructures<'a> {
         }
 
         let offset = self.offset;
-        let kind = match self.table.sdt.read_u16(offset) {
+        let kind = match read_u16(self.table.sdt, offset) {
             Ok(kind) => kind,
             Err(error) => return Some(Err(error.into())),
         };
-        let length = match self.table.sdt.read_u16(offset + 2) {
+        let length = match read_u16(self.table.sdt, offset + 2) {
             Ok(length) => usize::from(length),
             Err(error) => return Some(Err(error.into())),
         };
@@ -954,6 +1045,47 @@ mod tests {
     use crate::firm::pcie::{Bdf, PciDevice};
     use crate::{MmioAddr, MmioAddrRange, MmioRange};
     use acpi::sdt::Signature;
+    use kore_memory::{Mapping, PageSize, PageTableEntry, PageTableEntryKind};
+    use memory_addr::{PhysAddr, VirtAddr, VirtAddrRange};
+
+    #[derive(Clone, Copy, Debug)]
+    struct TestEntry;
+
+    impl PageTableEntry for TestEntry {
+        type Flags = ();
+
+        fn new_leaf(_paddr: PhysAddr, _flags: Self::Flags, _size: PageSize) -> Self {
+            Self
+        }
+
+        fn new_table(_paddr: PhysAddr, _level: u8) -> Self {
+            Self
+        }
+
+        fn paddr(&self) -> PhysAddr {
+            PhysAddr::from_usize(0)
+        }
+
+        fn flags(&self) -> Self::Flags {}
+
+        fn is_present(&self) -> bool {
+            true
+        }
+
+        fn entry_kind(&self, _level: u8) -> PageTableEntryKind {
+            PageTableEntryKind::Leaf
+        }
+
+        fn clear(&mut self) {}
+
+        fn bits(&self) -> u64 {
+            0
+        }
+
+        fn from_bits(_bits: u64) -> Self {
+            Self
+        }
+    }
 
     fn registers(base: usize) -> MmioAddrRange {
         <MmioAddrRange as MmioRange<usize>>::from_start_size(
@@ -967,6 +1099,24 @@ mod tests {
         bytes[0..4].copy_from_slice(signature.as_str().as_bytes());
         bytes[4..8].copy_from_slice(&(length as u32).to_le_bytes());
         bytes[8] = 1;
+    }
+
+    fn finish_sdt_checksum(bytes: &mut [u8]) {
+        bytes[9] = 0;
+        bytes[9] = 0u8.wrapping_sub(
+            bytes
+                .iter()
+                .fold(0, |sum: u8, byte| sum.wrapping_add(*byte)),
+        );
+    }
+
+    fn table_mapping(bytes: &[u8]) -> Mapping<TestEntry, VirtAddr> {
+        let start = VirtAddr::from_usize(bytes.as_ptr() as usize);
+        Mapping::new(
+            VirtAddrRange::from_start_size(start, bytes.len()),
+            PhysAddr::from_usize(0),
+            (),
+        )
     }
 
     #[test]
@@ -988,7 +1138,10 @@ mod tests {
             dmar[offset + 7] = function;
         }
 
-        let table = DmarTable::parse(&dmar).unwrap();
+        finish_sdt_checksum(&mut dmar);
+
+        let mapping = table_mapping(&dmar);
+        let table = unsafe { DmarTable::from_mapping(&mapping) }.unwrap();
         assert_eq!(table.host_address_width().unwrap(), 47);
 
         let units: heapless::Vec<_, 2> = table.structures().collect::<Result<_, _>>().unwrap();
@@ -1039,7 +1192,10 @@ mod tests {
         dmar[96] = 1;
         dmar[98..100].copy_from_slice(&2u16.to_le_bytes());
 
-        let table = DmarTable::parse(&dmar).unwrap();
+        finish_sdt_checksum(&mut dmar);
+
+        let mapping = table_mapping(&dmar);
+        let table = unsafe { DmarTable::from_mapping(&mapping) }.unwrap();
         let mut rmrr = None;
         table
             .for_each_rmrr(|region| {
@@ -1089,7 +1245,10 @@ mod tests {
         dmar[81] = 7;
         dmar[82..86].copy_from_slice(b"DEV0");
 
-        let table = DmarTable::parse(&dmar).unwrap();
+        finish_sdt_checksum(&mut dmar);
+
+        let mapping = table_mapping(&dmar);
+        let table = unsafe { DmarTable::from_mapping(&mapping) }.unwrap();
         let structures: heapless::Vec<_, 2> = table.structures().collect::<Result<_, _>>().unwrap();
         assert!(
             matches!(structures.as_slice(), [DmarStructure::Drhd(_), DmarStructure::Andd(andd)]
@@ -1148,7 +1307,10 @@ mod tests {
         dmar[78] = 5;
         dmar[79] = 1;
 
-        let table = DmarTable::parse(&dmar).unwrap();
+        finish_sdt_checksum(&mut dmar);
+
+        let mapping = table_mapping(&dmar);
+        let table = unsafe { DmarTable::from_mapping(&mapping) }.unwrap();
         let structures: heapless::Vec<_, 2> = table.structures().collect::<Result<_, _>>().unwrap();
         assert!(
             matches!(structures.as_slice(), [DmarStructure::Satc(satc), DmarStructure::Sidp(sidp)]

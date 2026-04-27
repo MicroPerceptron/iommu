@@ -36,8 +36,8 @@ impl From<crate::arch::x86_64::intel::dmar::DmarError> for Error {
     fn from(value: crate::arch::x86_64::intel::dmar::DmarError) -> Self {
         match value {
             crate::arch::x86_64::intel::dmar::DmarError::Acpi(_) => Self::InvalidController,
-            crate::arch::x86_64::intel::dmar::DmarError::Table(_)
-            | crate::arch::x86_64::intel::dmar::DmarError::BdfRanges(_)
+            crate::arch::x86_64::intel::dmar::DmarError::Mapping(error) => Self::PageTable(error),
+            crate::arch::x86_64::intel::dmar::DmarError::BdfRanges(_)
             | crate::arch::x86_64::intel::dmar::DmarError::Malformed(_) => Self::InvalidRange,
         }
     }
@@ -49,8 +49,8 @@ impl From<crate::arch::x86_64::amd::ivrs::IvrsError> for Error {
     fn from(value: crate::arch::x86_64::amd::ivrs::IvrsError) -> Self {
         match value {
             crate::arch::x86_64::amd::ivrs::IvrsError::Acpi(_) => Self::InvalidController,
-            crate::arch::x86_64::amd::ivrs::IvrsError::Table(_)
-            | crate::arch::x86_64::amd::ivrs::IvrsError::BdfRanges(_)
+            crate::arch::x86_64::amd::ivrs::IvrsError::Mapping(error) => Self::PageTable(error),
+            crate::arch::x86_64::amd::ivrs::IvrsError::BdfRanges(_)
             | crate::arch::x86_64::amd::ivrs::IvrsError::Malformed(_) => Self::InvalidRange,
         }
     }
@@ -62,8 +62,8 @@ impl From<crate::arch::aarch64::iort::IortError> for Error {
     fn from(value: crate::arch::aarch64::iort::IortError) -> Self {
         match value {
             crate::arch::aarch64::iort::IortError::Acpi(_) => Self::InvalidController,
-            crate::arch::aarch64::iort::IortError::Table(_)
-            | crate::arch::aarch64::iort::IortError::BdfRanges(_)
+            crate::arch::aarch64::iort::IortError::Mapping(error) => Self::PageTable(error),
+            crate::arch::aarch64::iort::IortError::BdfRanges(_)
             | crate::arch::aarch64::iort::IortError::Malformed(_) => Self::InvalidRange,
         }
     }

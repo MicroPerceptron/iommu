@@ -1,17 +1,15 @@
 //! AMD-Vi IVRS firmware table parsing.
 
-use core::fmt;
+use core::{fmt, mem::size_of};
 
 use acpi::{
-    AcpiError, AcpiTable, Handler, PhysicalMapping,
+    AcpiError, AcpiTable,
     sdt::{SdtHeader, Signature},
 };
-use memory_addr::{PhysAddr, PhysAddrRange};
+use kore_memory::{Mapping, PageTableEntry, PagingError};
+use memory_addr::{MemoryAddr, PhysAddr, PhysAddrRange, VirtAddr};
 
-use crate::firm::{
-    acpi::{AcpiTableBytesError, SdtBytes},
-    pcie::{Bdf, BdfRange, BdfRangeSet, BdfRangeSetError, PciDevice},
-};
+use crate::firm::pcie::{Bdf, BdfRange, BdfRangeSet, BdfRangeSetError, PciDevice};
 use crate::{MmioAddr, MmioAddrRange, MmioRange};
 
 const IVRS_IVINFO_OFFSET: usize = 36;
@@ -72,8 +70,8 @@ pub type IvrsBdfRangeSet = BdfRangeSet<IVRS_REQUESTER_WINDOW_CAPACITY>;
 #[derive(Clone, Debug)]
 pub enum IvrsError {
     Acpi(AcpiError),
-    Table(AcpiTableBytesError),
     BdfRanges(BdfRangeSetError),
+    Mapping(PagingError),
     Malformed(&'static str),
 }
 
@@ -84,13 +82,6 @@ impl From<AcpiError> for IvrsError {
     }
 }
 
-impl From<AcpiTableBytesError> for IvrsError {
-    #[inline]
-    fn from(value: AcpiTableBytesError) -> Self {
-        Self::Table(value)
-    }
-}
-
 impl From<BdfRangeSetError> for IvrsError {
     #[inline]
     fn from(value: BdfRangeSetError) -> Self {
@@ -98,12 +89,19 @@ impl From<BdfRangeSetError> for IvrsError {
     }
 }
 
+impl From<PagingError> for IvrsError {
+    #[inline]
+    fn from(value: PagingError) -> Self {
+        Self::Mapping(value)
+    }
+}
+
 impl fmt::Display for IvrsError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Acpi(error) => write!(f, "{error:?}"),
-            Self::Table(error) => write!(f, "{error}"),
             Self::BdfRanges(error) => write!(f, "{error}"),
+            Self::Mapping(error) => write!(f, "{error:?}"),
             Self::Malformed(message) => f.write_str(message),
         }
     }
@@ -150,42 +148,135 @@ unsafe impl AcpiTable for IvrsAcpiTable {
     }
 }
 
+fn table_bytes<'a, T: AcpiTable>(
+    bytes: &'a [u8],
+    short_header: &'static str,
+    short_table: &'static str,
+) -> Result<&'a [u8], IvrsError> {
+    if bytes.len() < size_of::<SdtHeader>() {
+        return Err(IvrsError::Malformed(short_header));
+    }
+
+    let header = unsafe { &*bytes.as_ptr().cast::<SdtHeader>() };
+    if header.signature != T::SIGNATURE {
+        return Err(IvrsError::Acpi(AcpiError::SdtInvalidSignature(
+            T::SIGNATURE,
+        )));
+    }
+
+    let length = header.length() as usize;
+    if length < size_of::<SdtHeader>() || length > bytes.len() {
+        return Err(IvrsError::Malformed(short_table));
+    }
+
+    unsafe { header.validate(T::SIGNATURE)? };
+    Ok(&bytes[..length])
+}
+
+unsafe fn from_mapping<Entry, P>(mapping: &Mapping<Entry, VirtAddr, P>) -> Result<&[u8], IvrsError>
+where
+    Entry: PageTableEntry,
+    P: MemoryAddr,
+{
+    let len = mapping.range.size();
+    let ptr = mapping.as_ptr_of::<u8>(0)?;
+    Ok(unsafe { core::slice::from_raw_parts(ptr, len) })
+}
+
+fn read_array<const N: usize>(
+    bytes: &[u8],
+    offset: usize,
+    message: &'static str,
+) -> Result<[u8; N], IvrsError> {
+    let end = offset
+        .checked_add(N)
+        .ok_or(IvrsError::Malformed("IVRS read offset overflow"))?;
+    let bytes = bytes
+        .get(offset..end)
+        .ok_or(IvrsError::Malformed(message))?;
+    let mut out = [0; N];
+    out.copy_from_slice(bytes);
+    Ok(out)
+}
+
+#[inline]
+fn read_u8(bytes: &[u8], offset: usize) -> Result<u8, IvrsError> {
+    bytes
+        .get(offset)
+        .copied()
+        .ok_or(IvrsError::Malformed("IVRS table read is out of bounds"))
+}
+
+#[inline]
+fn read_u16(bytes: &[u8], offset: usize) -> Result<u16, IvrsError> {
+    Ok(u16::from_le_bytes(read_array(
+        bytes,
+        offset,
+        "IVRS table read is out of bounds",
+    )?))
+}
+
+#[inline]
+fn read_u32(bytes: &[u8], offset: usize) -> Result<u32, IvrsError> {
+    Ok(u32::from_le_bytes(read_array(
+        bytes,
+        offset,
+        "IVRS table read is out of bounds",
+    )?))
+}
+
+#[inline]
+fn read_u64(bytes: &[u8], offset: usize) -> Result<u64, IvrsError> {
+    Ok(u64::from_le_bytes(read_array(
+        bytes,
+        offset,
+        "IVRS table read is out of bounds",
+    )?))
+}
+
 #[derive(Clone, Copy, Debug)]
 pub struct IvrsTable<'a> {
-    sdt: SdtBytes<'a>,
+    sdt: &'a [u8],
 }
 
 impl<'a> IvrsTable<'a> {
-    pub fn parse(bytes: &'a [u8]) -> Result<Self, IvrsError> {
-        let sdt = SdtBytes::new_for::<IvrsAcpiTable>(bytes)?;
+    fn parse(bytes: &'a [u8]) -> Result<Self, IvrsError> {
+        let sdt = table_bytes::<IvrsAcpiTable>(
+            bytes,
+            "IVRS table shorter than SDT header",
+            "IVRS table length is invalid",
+        )?;
         if sdt.len() < IVRS_BLOCKS_OFFSET {
             return Err(IvrsError::Malformed("IVRS table shorter than fixed header"));
         }
         Ok(Self { sdt })
     }
 
-    pub fn from_acpi_mapping<H>(
-        mapping: &'a PhysicalMapping<H, IvrsAcpiTable>,
+    /// Parse an IVRS table from an already-readable `kore_memory` mapping.
+    ///
+    /// # Safety
+    ///
+    /// `mapping` must remain live and readable for the returned table's
+    /// lifetime, and its virtual range must cover the complete ACPI table.
+    pub unsafe fn from_mapping<Entry, P>(
+        mapping: &'a Mapping<Entry, VirtAddr, P>,
     ) -> Result<Self, IvrsError>
     where
-        H: Handler,
+        Entry: PageTableEntry,
+        P: MemoryAddr,
     {
-        mapping.validate()?;
-        let sdt = SdtBytes::from_mapping(mapping)?;
-        if sdt.len() < IVRS_BLOCKS_OFFSET {
-            return Err(IvrsError::Malformed("IVRS table shorter than fixed header"));
-        }
-        Ok(Self { sdt })
+        let bytes = unsafe { from_mapping(mapping)? };
+        Self::parse(bytes)
     }
 
     #[inline]
     pub const fn bytes(self) -> &'a [u8] {
-        self.sdt.bytes()
+        self.sdt
     }
 
     #[inline]
     pub fn ivinfo(self) -> Result<u32, IvrsError> {
-        Ok(self.sdt.read_u32(IVRS_IVINFO_OFFSET)?)
+        read_u32(self.sdt, IVRS_IVINFO_OFFSET)
     }
 
     #[inline]
@@ -337,26 +428,26 @@ impl<'a> IvrsTable<'a> {
 
         Ok(Ivhd {
             block_type,
-            flags: self.sdt.read_u8(offset + IVHD_FLAGS_OFFSET)?,
-            capability_offset: self.sdt.read_u16(offset + IVHD_CAP_OFFSET)?,
+            flags: read_u8(self.sdt, offset + IVHD_FLAGS_OFFSET)?,
+            capability_offset: read_u16(self.sdt, offset + IVHD_CAP_OFFSET)?,
             registers: mmio_register_window(
-                self.sdt.read_u64(offset + IVHD_BASE_ADDR_OFFSET)?,
+                read_u64(self.sdt, offset + IVHD_BASE_ADDR_OFFSET)?,
                 AMD_VI_REGISTER_WINDOW_SIZE,
                 "IVHD base address cannot fit in usize",
                 "IVHD register window overflows",
             )?,
             device: PciDevice::from_segment_bdf(
-                self.sdt.read_u16(offset + IVHD_SEGMENT_OFFSET)?,
-                Bdf::from_u16(self.sdt.read_u16(offset + IVHD_DEVICE_ID_OFFSET)?),
+                read_u16(self.sdt, offset + IVHD_SEGMENT_OFFSET)?,
+                Bdf::from_u16(read_u16(self.sdt, offset + IVHD_DEVICE_ID_OFFSET)?),
             ),
-            iommu_info: self.sdt.read_u16(offset + IVHD_INFO_OFFSET)?,
+            iommu_info: read_u16(self.sdt, offset + IVHD_INFO_OFFSET)?,
             feature_info: if block_type == IVHD_TYPE_10H {
-                Some(self.sdt.read_u32(offset + IVHD_10H_FEATURE_OFFSET)?)
+                Some(read_u32(self.sdt, offset + IVHD_10H_FEATURE_OFFSET)?)
             } else {
                 None
             },
             efr: if matches!(block_type, IVHD_TYPE_11H | IVHD_TYPE_40H) {
-                Some(self.sdt.read_u64(offset + IVHD_11H_EFR_OFFSET)?)
+                Some(read_u64(self.sdt, offset + IVHD_11H_EFR_OFFSET)?)
             } else {
                 None
             },
@@ -373,12 +464,12 @@ impl<'a> IvrsTable<'a> {
         }
         Ok(Ivmd {
             ivmd_type: block_type,
-            flags: self.sdt.read_u8(offset + IVMD_FLAGS_OFFSET)?,
-            device_id: Bdf::from_u16(self.sdt.read_u16(offset + IVMD_DEVICE_ID_OFFSET)?),
-            aux_device_id: Bdf::from_u16(self.sdt.read_u16(offset + IVMD_AUX_OFFSET)?),
+            flags: read_u8(self.sdt, offset + IVMD_FLAGS_OFFSET)?,
+            device_id: Bdf::from_u16(read_u16(self.sdt, offset + IVMD_DEVICE_ID_OFFSET)?),
+            aux_device_id: Bdf::from_u16(read_u16(self.sdt, offset + IVMD_AUX_OFFSET)?),
             memory: phys_range_from_start_size(
-                self.sdt.read_u64(offset + IVMD_START_ADDR_OFFSET)?,
-                self.sdt.read_u64(offset + IVMD_MEM_LENGTH_OFFSET)?,
+                read_u64(self.sdt, offset + IVMD_START_ADDR_OFFSET)?,
+                read_u64(self.sdt, offset + IVMD_MEM_LENGTH_OFFSET)?,
                 "IVMD memory address cannot fit in usize",
                 "IVMD memory range overflows",
             )?,
@@ -400,7 +491,7 @@ impl<'a> IvrsTable<'a> {
 
         while offset < block_length {
             let entry_offset = block_offset + offset;
-            let entry_type = self.sdt.read_u8(entry_offset)?;
+            let entry_type = read_u8(self.sdt, entry_offset)?;
             let entry_size = match entry_type {
                 0x00..=0x04 => 4usize,
                 0x42 | 0x43 | 0x46 | 0x47 | 0x48 => 8usize,
@@ -411,7 +502,7 @@ impl<'a> IvrsTable<'a> {
                         ));
                     }
                     DEVENTRY_ACPI_NAMED_MIN_LENGTH
-                        + usize::from(self.sdt.read_u8(entry_offset + 21)?)
+                        + usize::from(read_u8(self.sdt, entry_offset + 21)?)
                 }
                 0xf1.. => break,
                 _ => 4usize,
@@ -423,13 +514,13 @@ impl<'a> IvrsTable<'a> {
 
             let (device_id, data_setting) = if entry_type == DEVENTRY_ACPI_NAMED {
                 (
-                    Bdf::from_u16(self.sdt.read_u16(entry_offset + 1)?),
-                    self.sdt.read_u8(entry_offset + 3)?,
+                    Bdf::from_u16(read_u16(self.sdt, entry_offset + 1)?),
+                    read_u8(self.sdt, entry_offset + 3)?,
                 )
             } else {
                 (
-                    Bdf::from_u16(self.sdt.read_u16(entry_offset + 2)?),
-                    self.sdt.read_u8(entry_offset + 1)?,
+                    Bdf::from_u16(read_u16(self.sdt, entry_offset + 2)?),
+                    read_u8(self.sdt, entry_offset + 1)?,
                 )
             };
             match entry_type {
@@ -450,7 +541,7 @@ impl<'a> IvrsTable<'a> {
                     pending_range_start = Some(PendingIvhdRange {
                         start: device_id,
                         kind: PendingIvhdRangeKind::Alias {
-                            source: Bdf::from_u16(self.sdt.read_u16(entry_offset + 6)?),
+                            source: Bdf::from_u16(read_u16(self.sdt, entry_offset + 6)?),
                         },
                         data_setting,
                     });
@@ -459,7 +550,7 @@ impl<'a> IvrsTable<'a> {
                     pending_range_start = Some(PendingIvhdRange {
                         start: device_id,
                         kind: PendingIvhdRangeKind::Extended {
-                            extended_data_setting: self.sdt.read_u32(entry_offset + 4)?,
+                            extended_data_setting: read_u32(self.sdt, entry_offset + 4)?,
                         },
                         data_setting,
                     });
@@ -496,25 +587,25 @@ impl<'a> IvrsTable<'a> {
                 }
                 DEVENTRY_ALIAS_SELECT => f(IvhdDeviceEntry::AliasSelect {
                     device_id,
-                    source: Bdf::from_u16(self.sdt.read_u16(entry_offset + 6)?),
+                    source: Bdf::from_u16(read_u16(self.sdt, entry_offset + 6)?),
                     data_setting,
                 })?,
                 DEVENTRY_EXTENDED_SELECT => f(IvhdDeviceEntry::ExtendedSelect {
                     device_id,
                     data_setting,
-                    extended_data_setting: self.sdt.read_u32(entry_offset + 4)?,
+                    extended_data_setting: read_u32(self.sdt, entry_offset + 4)?,
                 })?,
                 DEVENTRY_SPECIAL => f(IvhdDeviceEntry::Special {
-                    device_id: Bdf::from_u16(self.sdt.read_u16(entry_offset + 6)?),
+                    device_id: Bdf::from_u16(read_u16(self.sdt, entry_offset + 6)?),
                     variety: data_setting,
                 })?,
                 DEVENTRY_ACPI_NAMED => f(IvhdDeviceEntry::AcpiNamed {
                     device_id,
                     data_setting,
-                    hardware_id: self.sdt.read_u64(entry_offset + 4)?,
-                    compatible_id: self.sdt.read_u64(entry_offset + 12)?,
-                    uid_format: self.sdt.read_u8(entry_offset + 20)?,
-                    uid: &self.sdt.bytes()
+                    hardware_id: read_u64(self.sdt, entry_offset + 4)?,
+                    compatible_id: read_u64(self.sdt, entry_offset + 12)?,
+                    uid_format: read_u8(self.sdt, entry_offset + 20)?,
+                    uid: &self.sdt
                         [entry_offset + DEVENTRY_ACPI_NAMED_MIN_LENGTH..entry_offset + entry_size],
                 })?,
                 _ => {}
@@ -547,11 +638,11 @@ impl Iterator for IvrsBlocks<'_> {
         }
 
         let offset = self.offset;
-        let kind = match self.table.sdt.read_u8(offset) {
+        let kind = match read_u8(self.table.sdt, offset) {
             Ok(kind) => kind,
             Err(error) => return Some(Err(error.into())),
         };
-        let length = match self.table.sdt.read_u16(offset + IVHD_LENGTH_OFFSET) {
+        let length = match read_u16(self.table.sdt, offset + IVHD_LENGTH_OFFSET) {
             Ok(length) => usize::from(length),
             Err(error) => return Some(Err(error.into())),
         };
@@ -752,7 +843,47 @@ mod tests {
     use crate::firm::pcie::Bdf;
     use crate::{MmioAddr, MmioAddrRange, MmioRange};
     use acpi::sdt::Signature;
-    use memory_addr::{PhysAddr, PhysAddrRange};
+    use kore_memory::{Mapping, PageSize, PageTableEntry, PageTableEntryKind};
+    use memory_addr::{PhysAddr, PhysAddrRange, VirtAddr, VirtAddrRange};
+
+    #[derive(Clone, Copy, Debug)]
+    struct TestEntry;
+
+    impl PageTableEntry for TestEntry {
+        type Flags = ();
+
+        fn new_leaf(_paddr: PhysAddr, _flags: Self::Flags, _size: PageSize) -> Self {
+            Self
+        }
+
+        fn new_table(_paddr: PhysAddr, _level: u8) -> Self {
+            Self
+        }
+
+        fn paddr(&self) -> PhysAddr {
+            PhysAddr::from_usize(0)
+        }
+
+        fn flags(&self) -> Self::Flags {}
+
+        fn is_present(&self) -> bool {
+            true
+        }
+
+        fn entry_kind(&self, _level: u8) -> PageTableEntryKind {
+            PageTableEntryKind::Leaf
+        }
+
+        fn clear(&mut self) {}
+
+        fn bits(&self) -> u64 {
+            0
+        }
+
+        fn from_bits(_bits: u64) -> Self {
+            Self
+        }
+    }
 
     fn registers(base: usize) -> MmioAddrRange {
         <MmioAddrRange as MmioRange<usize>>::from_start_size(
@@ -766,6 +897,24 @@ mod tests {
         bytes[0..4].copy_from_slice(signature.as_str().as_bytes());
         bytes[4..8].copy_from_slice(&(length as u32).to_le_bytes());
         bytes[8] = 1;
+    }
+
+    fn finish_sdt_checksum(bytes: &mut [u8]) {
+        bytes[9] = 0;
+        bytes[9] = 0u8.wrapping_sub(
+            bytes
+                .iter()
+                .fold(0, |sum: u8, byte| sum.wrapping_add(*byte)),
+        );
+    }
+
+    fn table_mapping(bytes: &[u8]) -> Mapping<TestEntry, VirtAddr> {
+        let start = VirtAddr::from_usize(bytes.as_ptr() as usize);
+        Mapping::new(
+            VirtAddrRange::from_start_size(start, bytes.len()),
+            PhysAddr::from_usize(0),
+            (),
+        )
     }
 
     #[test]
@@ -789,7 +938,10 @@ mod tests {
         ivrs[76] = 0x02;
         ivrs[78..80].copy_from_slice(&0x211u16.to_le_bytes());
 
-        let table = IvrsTable::parse(&ivrs).unwrap();
+        finish_sdt_checksum(&mut ivrs);
+
+        let mapping = table_mapping(&ivrs);
+        let table = unsafe { IvrsTable::from_mapping(&mapping) }.unwrap();
         assert_eq!(table.ivinfo().unwrap(), 0x1234);
 
         let blocks: heapless::Vec<_, 2> = table.blocks().collect::<Result<_, _>>().unwrap();
@@ -817,7 +969,10 @@ mod tests {
         ivrs[56..64].copy_from_slice(&(0x2000_0000u64).to_le_bytes());
         ivrs[64..72].copy_from_slice(&(0x2000u64).to_le_bytes());
 
-        let table = IvrsTable::parse(&ivrs).unwrap();
+        finish_sdt_checksum(&mut ivrs);
+
+        let mapping = table_mapping(&ivrs);
+        let table = unsafe { IvrsTable::from_mapping(&mapping) }.unwrap();
         let blocks: heapless::Vec<_, 2> = table.blocks().collect::<Result<_, _>>().unwrap();
         let IvrsBlock::Ivmd(memory) = blocks[0] else {
             panic!("expected IVMD");
@@ -861,7 +1016,10 @@ mod tests {
         ivrs[117] = 4;
         ivrs[118..122].copy_from_slice(b"ID01");
 
-        let table = IvrsTable::parse(&ivrs).unwrap();
+        finish_sdt_checksum(&mut ivrs);
+
+        let mapping = table_mapping(&ivrs);
+        let table = unsafe { IvrsTable::from_mapping(&mapping) }.unwrap();
         let blocks: heapless::Vec<_, 2> = table.blocks().collect::<Result<_, _>>().unwrap();
         let IvrsBlock::Ivhd(unit) = blocks[0] else {
             panic!("expected IVHD");

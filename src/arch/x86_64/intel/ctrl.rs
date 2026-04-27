@@ -1,9 +1,15 @@
 //! Intel VT-d controller-side descriptor helpers.
 
-use kore_memory::{Mapping, PageSize, PageTableEntry};
-use memory_addr::{PhysAddrRange, VirtAddr};
+use core::hint::spin_loop;
 
-use crate::{CommandQueue, IoviAddr, MmioAddrRange, MmioRange, PciDevice, Result};
+use kore_memory::{Mapping, PageSize, PageTableEntry};
+use memory_addr::{MemoryAddr, PhysAddr, PhysAddrRange, VirtAddr};
+use x86_64::instructions::interrupts::without_interrupts;
+
+use crate::{
+    CommandQueue, FaultEventConfig, InterruptMessage, IoviAddr, MmioAddrRange, MmioRange,
+    PciDevice, Result,
+};
 
 use super::{
     caps::{VtdCapability, VtdExtendedCapability},
@@ -62,6 +68,7 @@ const QI_IEC_IDX_SHIFT: u64 = 32;
 
 const PAGE_ADDR_MASK: u64 = !0xfff_u64;
 const IVA_AM_MASK: u64 = 0x3f;
+const REGISTER_TRANSITION_POLL_LIMIT: usize = 1_000_000;
 
 /// Mapped VT-d register window.
 ///
@@ -157,6 +164,218 @@ where
     pub fn global_command(&mut self, command: u32) -> Result {
         self.write32(REG_GCMD, command)
     }
+
+    #[inline]
+    pub fn fault_status(&self) -> Result<u32> {
+        self.read32(REG_FSTS)
+    }
+
+    #[inline]
+    pub fn invalidate_queue_head(&self) -> Result<usize> {
+        self.read64(REG_IQH).map(|head| head as usize)
+    }
+
+    #[inline]
+    pub fn invalidate_queue_tail(&self) -> Result<usize> {
+        self.read64(REG_IQT).map(|tail| tail as usize)
+    }
+
+    #[inline]
+    pub fn write_invalidate_queue_tail(&mut self, tail: usize) -> Result {
+        self.write64(REG_IQT, tail as u64)
+    }
+
+    #[inline]
+    fn poll_transition() {
+        spin_loop();
+    }
+
+    pub fn wait_global_status(&self, mask: u32, expected: u32) -> Result {
+        for _ in 0..REGISTER_TRANSITION_POLL_LIMIT {
+            if (self.global_status()? & mask) == (expected & mask) {
+                return Ok(());
+            }
+            Self::poll_transition();
+        }
+
+        Err(VtdError::RegisterTransitionTimeout.into())
+    }
+
+    pub fn set_root_table(&mut self, root: PhysAddr) -> Result {
+        if !root.is_aligned(PageSize::Size4K.bytes()) {
+            return Err(VtdError::UnsupportedGranule.into());
+        }
+
+        without_interrupts(|| {
+            self.write64(REG_RTADDR, root.as_usize() as u64)?;
+            let status = self.global_status()?;
+            self.global_command(status | GCMD_SRTP)
+        })?;
+        self.wait_global_status(GSTS_RTPS, GSTS_RTPS)
+    }
+
+    pub fn set_translation_enabled(&mut self, enabled: bool) -> Result {
+        let status_bit = if enabled { GSTS_TES } else { 0 };
+
+        without_interrupts(|| {
+            let status = self.global_status()?;
+            let command = if enabled {
+                status | GCMD_TE
+            } else {
+                status & !GCMD_TE
+            };
+            self.global_command(command)
+        })?;
+        self.wait_global_status(GSTS_TES, status_bit)
+    }
+
+    #[inline]
+    pub fn enable_translation(&mut self) -> Result {
+        self.set_translation_enabled(true)
+    }
+
+    #[inline]
+    pub fn disable_translation(&mut self) -> Result {
+        self.set_translation_enabled(false)
+    }
+
+    pub fn set_queued_invalidation_enabled(&mut self, enabled: bool) -> Result {
+        let status_bit = if enabled { GSTS_QIES } else { 0 };
+
+        without_interrupts(|| {
+            let status = self.global_status()?;
+            let command = if enabled {
+                status | GCMD_QIE
+            } else {
+                status & !GCMD_QIE
+            };
+            self.global_command(command)
+        })?;
+        self.wait_global_status(GSTS_QIES, status_bit)
+    }
+
+    #[inline]
+    pub fn enable_queued_invalidation(&mut self) -> Result {
+        self.set_queued_invalidation_enabled(true)
+    }
+
+    #[inline]
+    pub fn disable_queued_invalidation(&mut self) -> Result {
+        self.set_queued_invalidation_enabled(false)
+    }
+
+    pub fn set_interrupt_remapping_enabled(&mut self, enabled: bool) -> Result {
+        let status_bit = if enabled { GSTS_IRES } else { 0 };
+
+        without_interrupts(|| {
+            let status = self.global_status()?;
+            let command = if enabled {
+                status | GCMD_IRE
+            } else {
+                status & !GCMD_IRE
+            };
+            self.global_command(command)
+        })?;
+        self.wait_global_status(GSTS_IRES, status_bit)
+    }
+
+    #[inline]
+    pub fn enable_interrupt_remapping(&mut self) -> Result {
+        self.set_interrupt_remapping_enabled(true)
+    }
+
+    #[inline]
+    pub fn disable_interrupt_remapping(&mut self) -> Result {
+        self.set_interrupt_remapping_enabled(false)
+    }
+
+    pub fn configure_fault_event(&mut self, config: FaultEventConfig) -> Result {
+        let message = config.message();
+        without_interrupts(|| {
+            self.write32(REG_FEDATA, message.data())?;
+            self.write32(REG_FEADDR, message.addr() as u32)?;
+            self.write32(REG_FEUADDR, (message.addr() >> 32) as u32)?;
+            self.write32(REG_FECTL, if config.enabled() { 0 } else { 1 })
+        })
+    }
+
+    #[inline]
+    pub fn fault_event_message(&self) -> Result<InterruptMessage> {
+        let data = self.read32(REG_FEDATA)?;
+        let low = self.read32(REG_FEADDR)? as u64;
+        let high = self.read32(REG_FEUADDR)? as u64;
+        Ok(InterruptMessage::new(low | (high << 32), data))
+    }
+
+    pub fn submit_queued_invalidation<const N: usize>(
+        &mut self,
+        queue: &VtdQueuedInvalidationQueue<N>,
+        descriptor: VtdQueuedInvalidationDescriptor,
+    ) -> Result {
+        let mut tail_result = Ok(());
+        let this = self as *mut Self;
+        descriptor.submit_to(
+            queue,
+            || unsafe { (&*this).invalidate_queue_head() },
+            |tail| unsafe { tail_result = (&mut *this).write_invalidate_queue_tail(tail) },
+            || unsafe { (&*this).fault_status().map(|_| ()) },
+        )?;
+        tail_result
+    }
+
+    #[inline]
+    pub fn invalidate_context_global<const N: usize>(
+        &mut self,
+        queue: &VtdQueuedInvalidationQueue<N>,
+    ) -> Result {
+        self.submit_queued_invalidation(queue, VtdQueuedInvalidationDescriptor::context_global())
+    }
+
+    #[inline]
+    pub fn invalidate_context_device<const N: usize>(
+        &mut self,
+        queue: &VtdQueuedInvalidationQueue<N>,
+        client: PciDevice,
+    ) -> Result {
+        self.submit_queued_invalidation(
+            queue,
+            VtdQueuedInvalidationDescriptor::context_device(client),
+        )
+    }
+
+    #[inline]
+    pub fn invalidate_iotlb_global<const N: usize>(
+        &mut self,
+        queue: &VtdQueuedInvalidationQueue<N>,
+        cap: VtdCapability,
+    ) -> Result {
+        self.submit_queued_invalidation(queue, VtdQueuedInvalidationDescriptor::iotlb_global(cap))
+    }
+
+    #[inline]
+    pub fn invalidate_iotlb_domain<const N: usize>(
+        &mut self,
+        queue: &VtdQueuedInvalidationQueue<N>,
+        domain: VtdIoDomain,
+        cap: VtdCapability,
+    ) -> Result {
+        self.submit_queued_invalidation(
+            queue,
+            VtdQueuedInvalidationDescriptor::iotlb_domain(domain, cap),
+        )
+    }
+
+    pub fn invalidate_iotlb_page<const N: usize>(
+        &mut self,
+        queue: &VtdQueuedInvalidationQueue<N>,
+        domain: VtdIoDomain,
+        iova: IoviAddr<u64>,
+        granule: PageSize,
+        cap: VtdCapability,
+    ) -> Result {
+        let descriptor = VtdQueuedInvalidationDescriptor::iotlb_page(domain, iova, granule, cap)?;
+        self.submit_queued_invalidation(queue, descriptor)
+    }
 }
 
 /// Raw queued-invalidation descriptor, ready to be written to a VT-d QI ring.
@@ -192,9 +411,9 @@ impl VtdQueuedInvalidationDescriptor {
         check_error: CE,
     ) -> Result
     where
-        RH: Fn() -> usize,
-        WT: Fn(usize),
-        CE: Fn() -> Result,
+        RH: FnMut() -> Result<usize>,
+        WT: FnMut(usize),
+        CE: FnMut() -> Result,
     {
         let mut bytes = [0u8; 16];
         bytes[..8].copy_from_slice(&self.low.to_le_bytes());
@@ -347,7 +566,7 @@ mod tests {
         let desc = VtdQueuedInvalidationDescriptor::context_global();
         desc.submit_to(
             &queue,
-            || head.load(Ordering::Acquire),
+            || Ok(head.load(Ordering::Acquire)),
             |tail| head.store(tail, Ordering::Release),
             || Ok(()),
         )
