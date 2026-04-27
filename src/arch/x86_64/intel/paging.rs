@@ -2,12 +2,13 @@
 
 use core::fmt;
 
+use kore_memory::{
+    AccessFlags, CachePolicy, MemoryAttributes, PageSize, PageTableEntry, PageTableEntryKind,
+    PageTableWalker, PagingMetaData,
+};
 use memory_addr::PhysAddr;
 
-use crate::{
-    AccessFlags, CachePolicy, DmaAttrs, IoviAddr, MemoryAttributes, PageSize, PageTableEntry,
-    PageTableEntryKind, PageTableWalker, PagingMetaData,
-};
+use crate::{DmaAttrs, IoviAddr};
 
 const ADDR_MASK: u64 = 0x000f_ffff_ffff_f000;
 const READ: u64 = 1 << 0;

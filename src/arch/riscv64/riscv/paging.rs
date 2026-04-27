@@ -1,8 +1,10 @@
 //! RISC-V IOMMU page-table aliases.
 
-use crate::{IoviAddr, PageSize, PageTableWalker, PagingMetaData};
+use kore_memory::{PageSize, PageTableWalker, PagingMetaData};
 
-pub use kpte::arch::riscv64::{
+use crate::IoviAddr;
+
+pub use kore_memory::arch::riscv64::{
     Rv64Flags as RvIommuFlags, Rv64Pte as RvIommuPte, Rv64SvpbmtPte as RvIommuSvpbmtPte,
 };
 

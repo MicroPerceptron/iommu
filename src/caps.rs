@@ -1,10 +1,10 @@
 use core::ops::{BitAnd, BitAndAssign, BitOr, BitOrAssign};
 
-use crate::{AccessFlags, MemoryAttributes};
+use kore_memory::{AccessFlags, MemoryAttributes};
 
 /// Target-neutral DMA access permissions.
 ///
-/// This intentionally aliases the permission substrate used by `kpte`
+/// This intentionally aliases the permission substrate used by `kore_memory`
 /// page-table entries so CPU and IOMMU mappings share the same mechanical
 /// access vocabulary.
 pub type DmaAccess = AccessFlags;

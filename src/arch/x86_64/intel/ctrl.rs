@@ -1,9 +1,9 @@
 //! Intel VT-d controller-side descriptor helpers.
 
-use kpte::{Mapping, PageTableEntry};
+use kore_memory::{Mapping, PageSize, PageTableEntry};
 use memory_addr::{PhysAddrRange, VirtAddr};
 
-use crate::{CommandQueue, IoviAddr, MmioAddrRange, MmioRange, PageSize, PciDevice, Result};
+use crate::{CommandQueue, IoviAddr, MmioAddrRange, MmioRange, PciDevice, Result};
 
 use super::{
     caps::{VtdCapability, VtdExtendedCapability},
@@ -67,7 +67,7 @@ const IVA_AM_MASK: u64 = 0x3f;
 ///
 /// The caller owns how the MMIO page is mapped. Once handed to this wrapper,
 /// register access goes through the volatile helpers already provided by
-/// `kpte::Mapping`, keeping VT-d code out of the raw pointer business.
+/// `kore_memory::Mapping`, keeping VT-d code out of the raw pointer business.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct VtdRegisterWindow<Entry>
 where
@@ -196,7 +196,10 @@ impl VtdQueuedInvalidationDescriptor {
         WT: Fn(usize),
         CE: Fn() -> Result,
     {
-        queue.submit128(self.low, self.high, read_head, write_tail, check_error)
+        let mut bytes = [0u8; 16];
+        bytes[..8].copy_from_slice(&self.low.to_le_bytes());
+        bytes[8..].copy_from_slice(&self.high.to_le_bytes());
+        queue.submit(bytes, read_head, write_tail, check_error)
     }
 
     #[inline]

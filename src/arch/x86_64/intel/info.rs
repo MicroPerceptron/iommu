@@ -1,8 +1,9 @@
 //! Intel VT-d controller and domain descriptors.
 
+use kore_memory::PageSize;
 use memory_addr::PhysAddr;
 
-use crate::{ControllerKind, IoDomain, IommuInfo, MmioAddrRange, PageSize, TranslationStage};
+use crate::{ControllerKind, IoDomain, IommuInfo, MmioAddrRange, TranslationStage};
 
 use super::{
     caps::{VtdCapability, VtdExtendedCapability},

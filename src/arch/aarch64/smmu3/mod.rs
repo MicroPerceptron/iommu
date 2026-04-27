@@ -1,8 +1,10 @@
 //! ARM SMMUv3 VMSA page-table aliases.
 
-use crate::{IoviAddr, PageSize, PageTableWalker, PagingMetaData};
+use kore_memory::{PageSize, PageTableWalker, PagingMetaData};
 
-pub use kpte::arch::aarch64::{
+use crate::IoviAddr;
+
+pub use kore_memory::arch::aarch64::{
     A64Flags as SmmuVmsaFlags, A64Pte4K48 as SmmuVmsaPte4K48, A64Pte4K52 as SmmuVmsaPte4K52,
     A64Pte16K48 as SmmuVmsaPte16K48, A64Pte16K52 as SmmuVmsaPte16K52,
     A64Pte64K48 as SmmuVmsaPte64K48, A64Pte64K52 as SmmuVmsaPte64K52,

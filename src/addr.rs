@@ -1,3 +1,5 @@
+#![allow(deprecated)]
+
 use core::{fmt, marker::PhantomData, mem::size_of};
 
 use memory_addr::{AddrRange, MemoryAddr, PhysAddr, PhysAddrRange};

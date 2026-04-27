@@ -1,14 +1,13 @@
 use core::{
     fmt::Debug,
     hint::spin_loop,
-    marker::PhantomData,
     sync::atomic::{AtomicU8, AtomicUsize, Ordering},
 };
 
-use kpte::{PageTable, TlbInvalidation};
+use kore_memory::{PageSize, PageTable, TlbInvalidation};
 use memory_addr::{MemoryAddr, PhysAddrRange, VirtAddr, VirtAddrRange};
 
-use crate::{Binding, BindingSelector, Error, IoviAddr, PageSize, Result, TranslationStage};
+use crate::{Binding, BindingSelector, Error, IoviAddr, Result, TranslationStage};
 
 const COMMAND_QUEUE_POLL_LIMIT: usize = 1_000_000;
 const QUEUE_SLOT_EMPTY: u8 = 0;
@@ -97,7 +96,7 @@ impl CommandQueueBacking {
         if entry_count == 0 || !entry_count.is_power_of_two() {
             return Err(Error::InvalidRange);
         }
-        if entry_bytes == 0 || !entry_bytes.is_power_of_two() || entry_bytes < 16 {
+        if entry_bytes == 0 || !entry_bytes.is_power_of_two() || entry_bytes < 8 {
             return Err(Error::InvalidGranule);
         }
         let size = entry_count
@@ -155,13 +154,13 @@ impl CommandQueueBacking {
     }
 }
 
-/// Lock-free 128-bit hardware command queue.
+/// Lock-free hardware command queue.
 ///
 /// This manages the shared ring mechanics used by VT-d queued invalidation
-/// and AMD-Vi command buffers. Descriptor encoding, register programming, and
-/// error checks stay in the concrete controller. `N` is only the
-/// software slot-state capacity; the active hardware queue depth still comes
-/// from [`CommandQueueBacking::entry_count`].
+/// and AMD-Vi command buffers. Descriptor width, descriptor encoding, register
+/// programming, and error checks stay in the concrete controller. `N` is only
+/// the software slot-state capacity; the active hardware queue depth still
+/// comes from [`CommandQueueBacking::entry_count`].
 #[derive(Debug)]
 pub struct CommandQueue<const N: usize> {
     backing: Option<CommandQueueBacking>,
@@ -209,10 +208,9 @@ impl<const N: usize> CommandQueue<N> {
     }
 
     #[inline]
-    pub fn submit128<RH, WT, CE>(
+    pub fn submit<const W: usize, RH, WT, CE>(
         &self,
-        low: u64,
-        high: u64,
+        bytes: [u8; W],
         read_head: RH,
         write_tail: WT,
         check_error: CE,
@@ -223,13 +221,16 @@ impl<const N: usize> CommandQueue<N> {
         CE: Fn() -> Result,
     {
         let backing = self.backing.ok_or(Error::ControllerUnavailable)?;
+        if W == 0 || !W.is_power_of_two() || W > backing.entry_bytes() {
+            return Err(Error::InvalidGranule);
+        }
         let ticket = self.claim.fetch_add(1, Ordering::AcqRel);
         self.wait_for_capacity(ticket, backing.entry_count())?;
 
         let slot = ticket & (backing.entry_count() - 1);
         self.wait_for_empty(slot)?;
         self.slot_state[slot].store(QUEUE_SLOT_WRITING, Ordering::Release);
-        self.write_slot128(backing, slot, low, high)?;
+        self.write_slot(backing, slot, &bytes)?;
         self.slot_state[slot].store(QUEUE_SLOT_READY, Ordering::Release);
 
         self.wait_to_publish(ticket)?;
@@ -311,21 +312,19 @@ impl<const N: usize> CommandQueue<N> {
     }
 
     #[inline]
-    fn write_slot128(
+    fn write_slot<const W: usize>(
         &self,
         backing: CommandQueueBacking,
         slot: usize,
-        low: u64,
-        high: u64,
+        bytes: &[u8; W],
     ) -> Result {
         let vaddr = backing.entry_vaddr(slot)?;
         unsafe {
-            vaddr.as_mut_ptr_of::<u64>().write_volatile(low);
-            vaddr
-                .checked_add(8)
-                .ok_or(Error::AddressOverflow)?
-                .as_mut_ptr_of::<u64>()
-                .write_volatile(high);
+            let base = vaddr.as_mut_ptr_of::<u8>();
+            for offset in 0..backing.entry_bytes() {
+                let value = bytes.get(offset).copied().unwrap_or(0);
+                base.add(offset).write_volatile(value);
+            }
         }
         Ok(())
     }
@@ -340,8 +339,8 @@ impl<const MAX_ENTRIES: usize> Default for CommandQueue<MAX_ENTRIES> {
 
 /// IOTLB invalidation contract.
 ///
-/// The supertrait is the CPU-side `kpte` invalidation hook. Device-facing
-/// implementations can therefore be passed directly into a `kpte` map/unmap
+/// The supertrait is the CPU-side `kore_memory` invalidation hook. Device-facing
+/// implementations can therefore be passed directly into a `kore_memory` map/unmap
 /// call while also carrying IOTLB and device-TLB invalidation primitives for
 /// the controller's post-write hardware synchronization.
 pub trait IoTlbInvalidation<V: MemoryAddr = IoviAddr>: TlbInvalidation<V> {
@@ -382,14 +381,18 @@ pub trait IoTlbInvalidation<V: MemoryAddr = IoviAddr>: TlbInvalidation<V> {
     }
 }
 
+/// Unit requester identity for APIs that need a client type but ignore it.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
+pub struct NoClient;
+
 /// No-op IOTLB invalidator for host tests and pre-hardware table construction.
 #[derive(Clone, Copy, Debug, Default)]
-pub struct NoIoTlbFlush<Client = ()>(PhantomData<fn() -> Client>);
+pub struct NoIoTlbFlush<Client = NoClient>(core::marker::PhantomData<fn() -> Client>);
 
 impl<Client> NoIoTlbFlush<Client> {
     #[inline]
     pub const fn new() -> Self {
-        Self(PhantomData)
+        Self(core::marker::PhantomData)
     }
 }
 
@@ -507,7 +510,7 @@ impl InvalidateOutcome {
 /// Live IOMMU controller contract.
 ///
 /// A controller is also a typed IOVA page table. Implementations can expose
-/// a concrete inner `kpte::PageTableWalker` and get most of the mapping
+/// a concrete inner `kore_memory::PageTableWalker` and get most of the mapping
 /// surface mechanically through the [`PageTable`] trait, while this trait
 /// adds the controller-specific attachment, invalidation, and fault paths.
 pub trait Controller<V: MemoryAddr = IoviAddr>: PageTable<V> {
@@ -589,11 +592,15 @@ mod tests {
     fn command_queue_submit_writes_entry_and_advances_tail() {
         let (queue, buffer, head) = test_queue();
         let tail = AtomicUsize::new(0);
+        let low = 0xaaaa_bbbb_cccc_ddddu64;
+        let high = 0x1111_2222_3333_4444u64;
+        let mut bytes = [0u8; 16];
+        bytes[..8].copy_from_slice(&low.to_ne_bytes());
+        bytes[8..].copy_from_slice(&high.to_ne_bytes());
 
         queue
-            .submit128(
-                0xaaaa_bbbb_cccc_ddddu64,
-                0x1111_2222_3333_4444u64,
+            .submit(
+                bytes,
                 || head.load(Ordering::Acquire),
                 |new_tail| {
                     tail.store(new_tail, Ordering::Release);
@@ -604,10 +611,7 @@ mod tests {
             .unwrap();
 
         assert_eq!(tail.load(Ordering::Acquire), ENTRY_BYTES);
-        assert_eq!(
-            read_slot(&buffer, 0),
-            (0xaaaa_bbbb_cccc_ddddu64, 0x1111_2222_3333_4444u64)
-        );
+        assert_eq!(read_slot(&buffer, 0), (low, high));
     }
 
     #[test]
@@ -616,10 +620,12 @@ mod tests {
 
         for i in 0..(ENTRIES * 2) {
             let marker = i as u64;
+            let mut bytes = [0u8; 16];
+            bytes[..8].copy_from_slice(&marker.to_ne_bytes());
+            bytes[8..].copy_from_slice(&(!marker).to_ne_bytes());
             queue
-                .submit128(
-                    marker,
-                    !marker,
+                .submit(
+                    bytes,
                     || head.load(Ordering::Acquire),
                     |new_tail| head.store(new_tail, Ordering::Release),
                     || Ok(()),

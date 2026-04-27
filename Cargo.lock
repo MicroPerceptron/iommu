@@ -114,15 +114,16 @@ dependencies = [
  "acpi",
  "fdt",
  "heapless",
- "kpte",
+ "kore-memory",
  "memory_addr",
  "riscv",
  "x86_64",
 ]
 
 [[package]]
-name = "kpte"
-version = "0.4.0"
+name = "kore-memory"
+version = "0.4.1"
+source = "git+https://github.com/MicroPerceptron/kore-memory.git#e03cdb79d665724d023401b8270d8ba419471372"
 dependencies = [
  "aarch64-cpu 11.2.0",
  "aarch64-cpu-ext",

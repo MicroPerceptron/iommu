@@ -1,6 +1,8 @@
 //! Intel VT-d capability register decoding.
 
-use crate::{CapabilityFlags, PageSize};
+use kore_memory::PageSize;
+
+use crate::CapabilityFlags;
 
 use super::paging::VtdSecondLevelAddressWidth;
 
