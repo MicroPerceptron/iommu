@@ -11,7 +11,10 @@ pub use ctrl::{
     VtdRegisterWindow,
 };
 pub use error::VtdError;
-pub use info::{VTD_DEFAULT_DOMAIN, VTD_DOMAIN_MASK, VtdDomain, VtdInfo, VtdIoDomain, VtdVersion};
+pub use info::{
+    VTD_DEFAULT_DOMAIN, VTD_DOMAIN_MASK, VtdDomain, VtdDomainActivation, VtdDomainControls,
+    VtdDomainToken, VtdInfo, VtdIoDomain, VtdVersion,
+};
 pub use paging::{
     VtdSecondLevelAddressWidth, VtdSecondLevelFlags, VtdSecondLevelMeta39, VtdSecondLevelMeta48,
     VtdSecondLevelMeta57, VtdSecondLevelPageTable39, VtdSecondLevelPageTable48,

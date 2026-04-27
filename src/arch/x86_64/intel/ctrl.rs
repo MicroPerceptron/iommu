@@ -201,7 +201,7 @@ where
         Err(VtdError::RegisterTransitionTimeout.into())
     }
 
-    pub fn set_root_table(&mut self, root: PhysAddr) -> Result {
+    pub fn set_root_entry_table(&mut self, root: PhysAddr) -> Result {
         if !root.is_aligned(PageSize::Size4K.bytes()) {
             return Err(VtdError::UnsupportedGranule.into());
         }

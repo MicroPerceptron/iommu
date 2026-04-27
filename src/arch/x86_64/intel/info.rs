@@ -1,7 +1,7 @@
 //! Intel VT-d controller and domain descriptors.
 
-use kore_memory::PageSize;
-use memory_addr::PhysAddr;
+use kore_memory::{AddrSpaceActivation, AddrSpaceToken, PageSize, PagingError, PagingResult};
+use memory_addr::{MemoryAddr, PhysAddr};
 
 use crate::{ControllerKind, IoDomain, IommuInfo, MmioAddrRange, TranslationStage};
 
@@ -85,6 +85,119 @@ impl VtdDomain {
     #[inline]
     pub const fn stage(self) -> TranslationStage {
         self.stage
+    }
+
+    #[inline]
+    pub const fn controls(self) -> VtdDomainControls {
+        VtdDomainControls::new(self.id, self.width)
+    }
+}
+
+impl From<VtdDomainToken> for VtdDomain {
+    #[inline]
+    fn from(value: VtdDomainToken) -> Self {
+        value.domain()
+    }
+}
+
+/// VT-d second-level address-space installation controls.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct VtdDomainControls {
+    id: VtdIoDomain,
+    width: VtdSecondLevelAddressWidth,
+}
+
+impl VtdDomainControls {
+    #[inline]
+    pub const fn new(id: VtdIoDomain, width: VtdSecondLevelAddressWidth) -> Self {
+        Self { id, width }
+    }
+
+    #[inline]
+    pub const fn id(self) -> VtdIoDomain {
+        self.id
+    }
+
+    #[inline]
+    pub const fn width(self) -> VtdSecondLevelAddressWidth {
+        self.width
+    }
+
+    #[inline]
+    pub const fn stage(self) -> TranslationStage {
+        TranslationStage::Stage2
+    }
+}
+
+/// Installed VT-d second-level address-space token.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct VtdDomainToken {
+    root: PhysAddr,
+    controls: VtdDomainControls,
+}
+
+impl VtdDomainToken {
+    #[inline]
+    pub const fn new(root: PhysAddr, controls: VtdDomainControls) -> Self {
+        Self { root, controls }
+    }
+
+    #[inline]
+    pub const fn controls(self) -> VtdDomainControls {
+        self.controls
+    }
+
+    #[inline]
+    pub const fn id(self) -> VtdIoDomain {
+        self.controls.id()
+    }
+
+    #[inline]
+    pub const fn width(self) -> VtdSecondLevelAddressWidth {
+        self.controls.width()
+    }
+
+    #[inline]
+    pub const fn stage(self) -> TranslationStage {
+        self.controls.stage()
+    }
+
+    #[inline]
+    pub const fn domain(self) -> VtdDomain {
+        VtdDomain::new(self.id(), self.root, self.width(), self.stage())
+    }
+}
+
+impl AddrSpaceToken for VtdDomainToken {
+    #[inline]
+    fn root(self) -> PhysAddr {
+        self.root
+    }
+}
+
+/// Stateless VT-d domain installer for `PageTable::install_with`.
+///
+/// This encodes the second-level page-table root into a domain token. Hardware
+/// activation is controller-specific because VT-d still has to publish that
+/// token through root/context tables for concrete requesters.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct VtdDomainActivation;
+
+impl AddrSpaceActivation for VtdDomainActivation {
+    type Token = VtdDomainToken;
+    type Controls = VtdDomainControls;
+
+    #[inline]
+    fn install(&self, root: PhysAddr, controls: Self::Controls) -> PagingResult<Self::Token> {
+        if !root.is_aligned(PageSize::Size4K.bytes()) {
+            return Err(PagingError::NotAligned);
+        }
+        Ok(VtdDomainToken::new(root, controls))
+    }
+
+    #[inline]
+    unsafe fn activate(&self, _token: Self::Token) -> PagingResult {
+        Err(PagingError::InvalidMappingShape)
     }
 }
 
@@ -208,5 +321,50 @@ mod tests {
         assert_eq!(domain.id(), 0x1234);
         assert_eq!(domain.generation(), 7);
         assert_eq!(VTD_DEFAULT_DOMAIN.id(), 1);
+    }
+
+    #[test]
+    fn domain_activation_installs_second_level_root_token() {
+        let activation = VtdDomainActivation;
+        let controls =
+            VtdDomainControls::new(VTD_DEFAULT_DOMAIN, VtdSecondLevelAddressWidth::Bits48);
+        let token = activation
+            .install(PhysAddr::from(0x4000usize), controls)
+            .unwrap();
+        let domain = token.domain();
+
+        assert_eq!(token.root(), PhysAddr::from(0x4000usize));
+        assert_eq!(token.controls(), controls);
+        assert_eq!(domain.id(), VTD_DEFAULT_DOMAIN);
+        assert_eq!(domain.root(), PhysAddr::from(0x4000usize));
+        assert_eq!(domain.width(), VtdSecondLevelAddressWidth::Bits48);
+        assert_eq!(domain.stage(), TranslationStage::Stage2);
+    }
+
+    #[test]
+    fn domain_activation_rejects_unaligned_roots() {
+        let activation = VtdDomainActivation;
+        let controls =
+            VtdDomainControls::new(VTD_DEFAULT_DOMAIN, VtdSecondLevelAddressWidth::Bits39);
+
+        assert_eq!(
+            activation.install(PhysAddr::from(0x1234usize), controls),
+            Err(PagingError::NotAligned)
+        );
+    }
+
+    #[test]
+    fn stateless_domain_activation_does_not_publish_to_hardware() {
+        let activation = VtdDomainActivation;
+        let controls =
+            VtdDomainControls::new(VTD_DEFAULT_DOMAIN, VtdSecondLevelAddressWidth::Bits39);
+        let token = activation
+            .install(PhysAddr::from(0x4000usize), controls)
+            .unwrap();
+
+        assert_eq!(
+            unsafe { activation.activate(token) },
+            Err(PagingError::InvalidMappingShape)
+        );
     }
 }
