@@ -15,26 +15,26 @@ const QUEUE_SLOT_WRITING: u8 = 1;
 const QUEUE_SLOT_READY: u8 = 2;
 const QUEUE_SLOT_PUBLISHED: u8 = 3;
 
-/// Target-neutral MSI/MSI-X style interrupt message.
+/// Target-neutral MSI/MSI-X delivery message.
 ///
 /// The host interrupt subsystem owns vector allocation and PCI capability
 /// programming. IOMMU controllers consume this value for controller-owned
 /// paths such as fault-event delivery or interrupt-remapping entries.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
-pub struct InterruptMessage {
-    addr: u64,
+pub struct MsiMessage {
+    address: u64,
     data: u32,
 }
 
-impl InterruptMessage {
+impl MsiMessage {
     #[inline]
-    pub const fn new(addr: u64, data: u32) -> Self {
-        Self { addr, data }
+    pub const fn new(address: u64, data: u32) -> Self {
+        Self { address, data }
     }
 
     #[inline]
-    pub const fn addr(self) -> u64 {
-        self.addr
+    pub const fn address(self) -> u64 {
+        self.address
     }
 
     #[inline]
@@ -43,27 +43,29 @@ impl InterruptMessage {
     }
 }
 
-/// Controller fault-event delivery configuration.
+/// Controller interrupt delivery route.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct FaultEventConfig {
-    message: InterruptMessage,
-    enabled: bool,
+pub enum InterruptRoute {
+    Disabled,
+    Msi(MsiMessage),
 }
 
-impl FaultEventConfig {
+impl InterruptRoute {
     #[inline]
-    pub const fn new(message: InterruptMessage, enabled: bool) -> Self {
-        Self { message, enabled }
+    pub const fn msi(message: MsiMessage) -> Self {
+        Self::Msi(message)
     }
 
     #[inline]
-    pub const fn message(self) -> InterruptMessage {
-        self.message
+    pub const fn is_enabled(self) -> bool {
+        matches!(self, Self::Msi(_))
     }
+}
 
+impl From<MsiMessage> for InterruptRoute {
     #[inline]
-    pub const fn enabled(self) -> bool {
-        self.enabled
+    fn from(value: MsiMessage) -> Self {
+        Self::Msi(value)
     }
 }
 
@@ -146,6 +148,117 @@ impl CommandQueueBacking {
     fn entry_vaddr(self, slot: usize) -> Result<VirtAddr> {
         let offset = slot
             .checked_mul(self.entry_bytes)
+            .ok_or(Error::AddressOverflow)?;
+        self.virt
+            .start
+            .checked_add(offset)
+            .ok_or(Error::AddressOverflow)
+    }
+}
+
+/// Caller-provided backing for a fixed-width hardware descriptor table.
+///
+/// This is the shared shape behind IOMMU-owned tables whose entries are
+/// hardware-defined descriptors rather than `kore_memory` page-table entries:
+/// the caller provides physically contiguous memory and a live writable virtual
+/// mapping, while the architecture-specific layer owns the descriptor encoding.
+///
+/// Use this for requester-routing tables, command-side tables, interrupt
+/// remapping tables, and similar controller-owned descriptor arrays. DMA
+/// translation page tables should keep using `kore_memory::PageTableEntry` and
+/// `kore_memory::PageTable`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct DescriptorTableBacking<const ENTRY_BYTES: usize> {
+    phys: PhysAddrRange,
+    virt: VirtAddrRange,
+    entry_count: usize,
+}
+
+impl<const ENTRY_BYTES: usize> DescriptorTableBacking<ENTRY_BYTES> {
+    /// # Safety
+    ///
+    /// `virt` must be a live writable mapping of `phys` for at least
+    /// `entry_count * ENTRY_BYTES` bytes, and the memory must remain owned by
+    /// the hardware table while the controller can read it.
+    #[inline]
+    pub unsafe fn new(
+        phys: PhysAddrRange,
+        virt: VirtAddrRange,
+        entry_count: usize,
+    ) -> Result<Self> {
+        unsafe { Self::new_aligned(phys, virt, entry_count, ENTRY_BYTES) }
+    }
+
+    /// # Safety
+    ///
+    /// Same as [`Self::new`], with an additional physical-base alignment
+    /// requirement for table formats that require page-aligned roots.
+    #[inline]
+    pub unsafe fn new_aligned(
+        phys: PhysAddrRange,
+        virt: VirtAddrRange,
+        entry_count: usize,
+        phys_alignment: usize,
+    ) -> Result<Self> {
+        if ENTRY_BYTES == 0 || !ENTRY_BYTES.is_power_of_two() {
+            return Err(Error::InvalidGranule);
+        }
+        if entry_count == 0 {
+            return Err(Error::InvalidRange);
+        }
+        if phys_alignment == 0 || !phys_alignment.is_power_of_two() {
+            return Err(Error::InvalidGranule);
+        }
+
+        let size = entry_count
+            .checked_mul(ENTRY_BYTES)
+            .ok_or(Error::AddressOverflow)?;
+        if phys.size() < size || virt.size() < size {
+            return Err(Error::InvalidRange);
+        }
+        if phys.start.as_usize() % phys_alignment != 0 || virt.start.as_usize() % ENTRY_BYTES != 0 {
+            return Err(Error::InvalidAddress);
+        }
+
+        Ok(Self {
+            phys,
+            virt,
+            entry_count,
+        })
+    }
+
+    #[inline]
+    pub const fn phys(self) -> PhysAddrRange {
+        self.phys
+    }
+
+    #[inline]
+    pub const fn virt(self) -> VirtAddrRange {
+        self.virt
+    }
+
+    #[inline]
+    pub const fn entry_count(self) -> usize {
+        self.entry_count
+    }
+
+    #[inline]
+    pub const fn entry_bytes(self) -> usize {
+        ENTRY_BYTES
+    }
+
+    #[inline]
+    pub fn byte_len(self) -> usize {
+        self.entry_count * ENTRY_BYTES
+    }
+
+    #[inline]
+    pub fn entry_vaddr(self, index: usize) -> Result<VirtAddr> {
+        if index >= self.entry_count {
+            return Err(Error::InvalidRange);
+        }
+        let offset = index
+            .checked_mul(ENTRY_BYTES)
             .ok_or(Error::AddressOverflow)?;
         self.virt
             .start
@@ -528,7 +641,7 @@ pub trait Controller<V: MemoryAddr = IoviAddr>: PageTable<V> {
     fn unbind(&mut self, client: Self::Client, selector: BindingSelector) -> Result;
     fn invalidator(&self) -> &Self::Invalidator;
     fn invalidate(&mut self, request: Invalidate<Self::Client, V>) -> Result<InvalidateOutcome>;
-    fn configure_fault_event(&mut self, config: FaultEventConfig) -> Result;
+    fn configure_fault_event(&mut self, route: InterruptRoute) -> Result;
     fn poll_fault(&mut self) -> Result<Option<Self::Fault>>;
 }
 
@@ -566,6 +679,16 @@ mod tests {
         let low = u64::from_ne_bytes(buffer[offset..offset + 8].try_into().unwrap());
         let high = u64::from_ne_bytes(buffer[offset + 8..offset + 16].try_into().unwrap());
         (low, high)
+    }
+
+    #[test]
+    fn interrupt_route_tracks_msi_delivery_state() {
+        let message = MsiMessage::new(0xfee0_0000, 0x45);
+        let route = InterruptRoute::from(message);
+
+        assert!(route.is_enabled());
+        assert_eq!(route, InterruptRoute::Msi(message));
+        assert!(!InterruptRoute::Disabled.is_enabled());
     }
 
     #[test]

@@ -18,8 +18,9 @@ pub use caps::{
     Binding, BindingSelector, BindingTarget, CapabilityFlags, DmaAccess, DmaAttrs, TranslationStage,
 };
 pub use ctrl::{
-    CommandQueue, CommandQueueBacking, Controller, FaultEventConfig, InterruptMessage, Invalidate,
-    InvalidateOutcome, InvalidateScope, IoTlbInvalidation, NoClient, NoIoTlbFlush,
+    CommandQueue, CommandQueueBacking, Controller, DescriptorTableBacking, InterruptRoute,
+    Invalidate, InvalidateOutcome, InvalidateScope, IoTlbInvalidation, MsiMessage, NoClient,
+    NoIoTlbFlush,
 };
 pub use error::{Error, Result};
 pub use firm::pcie::{Bdf, BdfRange, BdfRangeSet, PciDevice};
