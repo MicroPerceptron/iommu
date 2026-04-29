@@ -11,21 +11,27 @@
 //! interrupt-remapping entries are not page-table entries: they publish or
 //! synchronize translation domains, but they do not describe IOVA leaves.
 
-use core::hint::spin_loop;
+use core::{hint::spin_loop, marker::PhantomData, mem::size_of};
 
-use kore_memory::{Mapping, PageSize, PageTableEntry};
-use memory_addr::{MemoryAddr, PhysAddr, PhysAddrRange, VirtAddr, VirtAddrRange};
+use kore_memory::{
+    IntoMapBacking, Mapping, MappingFlags, PageSize, PageTable, PageTableEntry, PagingResult,
+    TlbInvalidation,
+};
+use memory_addr::{AddrRange, MemoryAddr, PhysAddr, PhysAddrRange, VirtAddr, VirtAddrRange};
 use x86_64::instructions::interrupts::without_interrupts;
 
 use crate::{
-    Binding, BindingSelector, BindingTarget, CommandQueue, DescriptorTableBacking, Error,
-    InterruptRoute, IoviAddr, MmioAddrRange, MmioRange, MsiMessage, PciDevice, Result,
+    Bdf, Binding, BindingSelector, BindingTarget, CommandQueue, CommandQueueBacking, Controller,
+    DescriptorTableBacking, DmaAccess, Error, InterruptRoute, Invalidate, InvalidateOutcome,
+    InvalidateScope, IoTlbInvalidation, IoviAddr, MmioAddrRange, MmioRange, MsiMessage, PciDevice,
+    Result,
 };
 
 use super::{
     caps::{VtdCapability, VtdExtendedCapability},
     error::VtdError,
-    info::{VtdDomain, VtdIoDomain, VtdVersion},
+    info::{VtdDomain, VtdInfo, VtdIoDomain, VtdVersion},
+    paging::VtdSecondLevelPte,
 };
 use crate::arch::x86_64::{
     X86InterruptVector, X86MsiDelivery, X86MsiDeliveryMode, X86MsiDestination, X86MsiTriggerMode,
@@ -79,6 +85,9 @@ const QI_IOTLB_DID_SHIFT: u64 = 16;
 
 const QI_IEC_SELECTIVE: u64 = 1 << 4;
 const QI_IEC_IDX_SHIFT: u64 = 32;
+const QI_ENTRY_BYTES: usize = 16;
+const QI_MIN_ENTRIES: usize = 256;
+const IQA_SIZE_MASK: u64 = 0x7;
 
 const IRTA_SIZE_MASK: u64 = 0xf;
 const IRTA_EIME: u64 = 1 << 11;
@@ -119,6 +128,29 @@ const TABLE_ADDR_MASK: u64 = 0x000f_ffff_ffff_f000;
 const IVA_AM_MASK: u64 = 0x3f;
 const FECTL_INTERRUPT_MASK: u32 = 1 << 31;
 const REGISTER_TRANSITION_POLL_LIMIT: usize = 1_000_000;
+const FSTS_PFO: u32 = 1 << 0;
+const FSTS_PPF: u32 = 1 << 1;
+const FSTS_AFO: u32 = 1 << 2;
+const FSTS_APF: u32 = 1 << 3;
+const FSTS_IQE: u32 = 1 << 4;
+const FSTS_ICE: u32 = 1 << 5;
+const FSTS_ITE: u32 = 1 << 6;
+const FSTS_PRO: u32 = 1 << 7;
+const FSTS_FRI_SHIFT: u32 = 8;
+const FSTS_FRI_MASK: u32 = 0xff;
+const FRCD_ENTRY_STRIDE: usize = 16;
+const FRCD_LOW_OFFSET: usize = 0;
+const FRCD_HIGH_OFFSET: usize = 8;
+const FRCDL_FAULT_INFO_MASK: u64 = !0xfff_u64;
+const FRCDH_FAULT: u64 = 1 << 63;
+const FRCDH_TYPE_1: u64 = 1 << 62;
+const FRCDH_REASON_SHIFT: u64 = 32;
+const FRCDH_REASON_MASK: u64 = 0xff;
+const FRCDH_PRIVILEGE: u64 = 1 << 31;
+const FRCDH_EXECUTE: u64 = 1 << 30;
+const FRCDH_TYPE_2: u64 = 1 << 28;
+const FRCDH_SOURCE_ID_MASK: u64 = 0xffff;
+const IOTLB_RANGE_DOMAIN_INVALIDATION_THRESHOLD: usize = 32;
 
 /// Caller-provided backing for the VT-d requester root-entry table.
 ///
@@ -768,6 +800,24 @@ where
     }
 
     #[inline]
+    fn write64_shared(&self, offset: usize, value: u64) -> Result {
+        let end = offset
+            .checked_add(size_of::<u64>())
+            .ok_or(Error::AddressOverflow)?;
+        if end > self.mapping.range.size() {
+            return Err(Error::InvalidRange);
+        }
+        let addr = self
+            .mapping
+            .range
+            .start
+            .checked_add(offset)
+            .ok_or(Error::AddressOverflow)?;
+        unsafe { addr.as_mut_ptr_of::<u64>().write_volatile(value) };
+        Ok(())
+    }
+
+    #[inline]
     pub fn modify64(&mut self, offset: usize, f: impl FnOnce(u64) -> u64) -> Result<u64> {
         self.mapping.modify_vo64(offset, f).map_err(Into::into)
     }
@@ -818,6 +868,11 @@ where
     }
 
     #[inline]
+    pub fn write_invalidate_queue_tail_shared(&self, tail: usize) -> Result {
+        self.write64_shared(REG_IQT, tail as u64)
+    }
+
+    #[inline]
     fn poll_transition() {
         spin_loop();
     }
@@ -844,6 +899,14 @@ where
             self.global_command(status | GCMD_SRTP)
         })?;
         self.wait_global_status(GSTS_RTPS, GSTS_RTPS)
+    }
+
+    pub fn set_queued_invalidation_table(&mut self, backing: CommandQueueBacking) -> Result {
+        let iqa = queued_invalidation_table_address(backing)?;
+        without_interrupts(|| {
+            self.write64(REG_IQA, iqa)?;
+            self.write64(REG_IQT, 0)
+        })
     }
 
     #[inline]
@@ -1140,6 +1203,779 @@ where
     }
 }
 
+/// VT-d fault source decoded from FSTS/FRCD state.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum VtdFaultReason {
+    Primary { raw: u8 },
+    PrimaryFaultOverflow,
+    AdvancedFaultOverflow,
+    AdvancedPendingFault,
+    InvalidationQueueError,
+    InvalidationCompletionError,
+    InvalidationTimeout,
+    PageRequestOverflow,
+}
+
+/// One decoded VT-d fault observation.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct VtdFault {
+    reason: VtdFaultReason,
+    source_id: Option<u16>,
+    client: Option<PciDevice>,
+    iova: Option<IoviAddr<u64>>,
+    access: DmaAccess,
+    record_index: Option<u16>,
+    overflow: bool,
+    pending: bool,
+}
+
+impl VtdFault {
+    #[inline]
+    pub const fn new(
+        reason: VtdFaultReason,
+        source_id: Option<u16>,
+        client: Option<PciDevice>,
+        iova: Option<IoviAddr<u64>>,
+        access: DmaAccess,
+        record_index: Option<u16>,
+        overflow: bool,
+        pending: bool,
+    ) -> Self {
+        Self {
+            reason,
+            source_id,
+            client,
+            iova,
+            access,
+            record_index,
+            overflow,
+            pending,
+        }
+    }
+
+    #[inline]
+    pub const fn reason(self) -> VtdFaultReason {
+        self.reason
+    }
+
+    #[inline]
+    pub const fn source_id(self) -> Option<u16> {
+        self.source_id
+    }
+
+    #[inline]
+    pub const fn client(self) -> Option<PciDevice> {
+        self.client
+    }
+
+    #[inline]
+    pub const fn iova(self) -> Option<IoviAddr<u64>> {
+        self.iova
+    }
+
+    #[inline]
+    pub const fn access(self) -> DmaAccess {
+        self.access
+    }
+
+    #[inline]
+    pub const fn record_index(self) -> Option<u16> {
+        self.record_index
+    }
+
+    #[inline]
+    pub const fn overflow(self) -> bool {
+        self.overflow
+    }
+
+    #[inline]
+    pub const fn pending(self) -> bool {
+        self.pending
+    }
+}
+
+/// Runtime state for one Intel VT-d remapping unit.
+pub struct VtdUnit<Entry, const QN: usize>
+where
+    Entry: PageTableEntry,
+{
+    info: VtdInfo,
+    registers: VtdRegisterWindow<Entry>,
+    root_table: VtdRootTableBacking,
+    context_tables: [Option<VtdContextTableBacking>; ROOT_ENTRY_COUNT],
+    queue: VtdQueuedInvalidationQueue<QN>,
+    interrupt_remap_table: Option<VtdInterruptRemapTableBacking>,
+}
+
+impl<Entry, const QN: usize> VtdUnit<Entry, QN>
+where
+    Entry: PageTableEntry,
+{
+    #[inline]
+    pub const fn new(
+        info: VtdInfo,
+        registers: VtdRegisterWindow<Entry>,
+        root_table: VtdRootTableBacking,
+    ) -> Self {
+        Self {
+            info,
+            registers,
+            root_table,
+            context_tables: [None; ROOT_ENTRY_COUNT],
+            queue: VtdQueuedInvalidationQueue::new(),
+            interrupt_remap_table: None,
+        }
+    }
+
+    #[inline]
+    pub const fn info(&self) -> &VtdInfo {
+        &self.info
+    }
+
+    #[inline]
+    pub const fn registers(&self) -> &VtdRegisterWindow<Entry> {
+        &self.registers
+    }
+
+    #[inline]
+    pub const fn registers_mut(&mut self) -> &mut VtdRegisterWindow<Entry> {
+        &mut self.registers
+    }
+
+    #[inline]
+    pub const fn root_table(&self) -> VtdRootTableBacking {
+        self.root_table
+    }
+
+    #[inline]
+    pub fn queue(&self) -> &VtdQueuedInvalidationQueue<QN> {
+        &self.queue
+    }
+
+    #[inline]
+    pub fn interrupt_remap_table(&self) -> Option<VtdInterruptRemapTableBacking> {
+        self.interrupt_remap_table
+    }
+
+    #[inline]
+    pub fn install_interrupt_remap_table(&mut self, table: VtdInterruptRemapTableBacking) {
+        self.interrupt_remap_table = Some(table);
+    }
+
+    pub fn install_context_table(&mut self, bus: u8, table: VtdContextTableBacking) -> Result {
+        self.registers.write_root_entry(
+            self.root_table,
+            bus,
+            VtdRootEntry::from_context_table(table)?,
+        )?;
+        self.context_tables[VtdRootTableBacking::bus_entry_index(bus)] = Some(table);
+        Ok(())
+    }
+
+    #[inline]
+    pub fn context_table(&self, bus: u8) -> Option<VtdContextTableBacking> {
+        self.context_tables[VtdRootTableBacking::bus_entry_index(bus)]
+    }
+
+    pub fn install_queued_invalidation(&mut self, backing: CommandQueueBacking) -> Result {
+        queued_invalidation_table_address(backing)?;
+        self.queue.init(backing)?;
+        self.registers.set_queued_invalidation_table(backing)?;
+        self.registers.enable_queued_invalidation()
+    }
+
+    pub fn enable_translation(&mut self) -> Result {
+        self.registers.set_root_table(self.root_table)?;
+        if !self.queue.is_active() {
+            return Err(Error::ControllerUnavailable);
+        }
+        if (self.registers.global_status()? & GSTS_QIES) == 0 {
+            self.registers.enable_queued_invalidation()?;
+        }
+        self.registers.enable_translation()
+    }
+
+    #[inline]
+    fn validate_client(&self, client: PciDevice) -> Result {
+        if self
+            .info
+            .base()
+            .segment()
+            .is_some_and(|segment| segment != client.segment())
+        {
+            return Err(Error::InvalidClient);
+        }
+        Ok(())
+    }
+
+    #[inline]
+    fn context_table_for_client(&self, client: PciDevice) -> Result<VtdContextTableBacking> {
+        self.context_table(client.bus())
+            .ok_or(Error::ControllerUnavailable)
+    }
+
+    fn submit_queued_invalidation(&self, descriptor: VtdQueuedInvalidationDescriptor) -> Result {
+        let mut tail_result = Ok(());
+        descriptor.submit_to(
+            &self.queue,
+            || self.registers.invalidate_queue_head(),
+            |tail| tail_result = self.registers.write_invalidate_queue_tail_shared(tail),
+            || self.registers.fault_status().map(|_| ()),
+        )?;
+        tail_result
+    }
+
+    #[inline]
+    fn invalidate_context_device(&self, client: PciDevice) -> Result {
+        self.submit_queued_invalidation(VtdQueuedInvalidationDescriptor::context_device(client))
+    }
+
+    #[inline]
+    fn invalidate_iotlb_domain(&self, domain: VtdIoDomain) -> Result {
+        self.submit_queued_invalidation(VtdQueuedInvalidationDescriptor::iotlb_domain(
+            domain,
+            self.info.cap(),
+        ))
+    }
+
+    #[inline]
+    fn invalidate_iotlb_global(&self) -> Result {
+        self.submit_queued_invalidation(VtdQueuedInvalidationDescriptor::iotlb_global(
+            self.info.cap(),
+        ))
+    }
+
+    fn invalidate_iotlb_page(
+        &self,
+        domain: VtdIoDomain,
+        iova: IoviAddr<u64>,
+        granule: PageSize,
+    ) -> Result<InvalidateScope> {
+        match VtdQueuedInvalidationDescriptor::iotlb_page(domain, iova, granule, self.info.cap()) {
+            Ok(descriptor) => {
+                self.submit_queued_invalidation(descriptor)?;
+                Ok(InvalidateScope::Leaf)
+            }
+            Err(Error::FeatureUnavailable) => {
+                self.invalidate_iotlb_domain(domain)?;
+                Ok(InvalidateScope::Domain)
+            }
+            Err(error) => Err(error),
+        }
+    }
+
+    fn invalidate_iotlb_range(
+        &self,
+        domain: VtdIoDomain,
+        start: IoviAddr<u64>,
+        page_size: PageSize,
+        count_pages: usize,
+    ) -> Result<InvalidateScope> {
+        if count_pages == 0 {
+            return Ok(InvalidateScope::Leaf);
+        }
+
+        let cap = self.info.cap();
+        let Some(min_mask) = vtd_iotlb_granule_address_mask(page_size) else {
+            self.invalidate_iotlb_domain(domain)?;
+            return Ok(InvalidateScope::Domain);
+        };
+        let max_mask = cap
+            .max_address_mask_value()
+            .min(IVA_AM_MASK as u8)
+            .min((usize::BITS - 1) as u8);
+
+        let page_span = 1usize
+            .checked_shl(u32::from(min_mask))
+            .ok_or(Error::AddressOverflow)?;
+        let start_page = (start.as_usize() & PAGE_ADDR_MASK as usize) >> 12;
+        if !cap.page_selective_invalidation()
+            || max_mask < min_mask
+            || (start_page & (page_span - 1)) != 0
+        {
+            self.invalidate_iotlb_domain(domain)?;
+            return Ok(InvalidateScope::Domain);
+        }
+
+        let total_pages = count_pages
+            .checked_mul(page_span)
+            .ok_or(Error::AddressOverflow)?;
+        let plan = VtdIotlbRangePlan::new(start_page, total_pages, min_mask, max_mask)?;
+        if plan.descriptor_count() > IOTLB_RANGE_DOMAIN_INVALIDATION_THRESHOLD {
+            self.invalidate_iotlb_domain(domain)?;
+            return Ok(InvalidateScope::Domain);
+        }
+
+        let mut cursor = plan;
+        while let Some(block) = cursor.next_block() {
+            let iova =
+                IoviAddr::<u64>::from(block.page.checked_shl(12).ok_or(Error::AddressOverflow)?);
+            let descriptor = VtdQueuedInvalidationDescriptor::iotlb_page_with_address_mask(
+                domain,
+                iova,
+                block.address_mask,
+                cap,
+            )?;
+            self.submit_queued_invalidation(descriptor)?;
+        }
+
+        Ok(InvalidateScope::Leaf)
+    }
+
+    fn bind_context(
+        &mut self,
+        active_domain: VtdDomain,
+        binding: Binding<PciDevice, VtdDomain>,
+    ) -> Result {
+        if binding.selector() != BindingSelector::Default {
+            return Err(Error::FeatureUnavailable);
+        }
+        self.validate_client(binding.client())?;
+
+        if let BindingTarget::Domain(domain) = binding.target() {
+            if domain != active_domain {
+                return Err(Error::InvalidAddressSpace);
+            }
+        }
+
+        let table = self.context_table_for_client(binding.client())?;
+        self.registers.write_context_entry(
+            table,
+            binding.client(),
+            VtdContextEntry::from_binding(binding, self.info.ecap())?,
+        )?;
+        self.invalidate_context_device(binding.client())?;
+        self.invalidate_iotlb_domain(active_domain.id())?;
+        Ok(())
+    }
+
+    fn unbind_context(
+        &mut self,
+        domain: VtdDomain,
+        client: PciDevice,
+        selector: BindingSelector,
+    ) -> Result {
+        if selector != BindingSelector::Default {
+            return Err(Error::FeatureUnavailable);
+        }
+        self.validate_client(client)?;
+        let table = self.context_table_for_client(client)?;
+        self.registers.clear_context_entry(table, client)?;
+        self.invalidate_context_device(client)?;
+        self.invalidate_iotlb_domain(domain.id())?;
+        Ok(())
+    }
+
+    pub fn poll_fault(&mut self) -> Result<Option<VtdFault>> {
+        let status = self.registers.fault_status()?;
+        if (status & FSTS_PPF) != 0 {
+            return self.poll_primary_fault(status);
+        }
+        if let Some(fault) = decode_fault_status(status) {
+            self.clear_fault_status(status);
+            return Ok(Some(fault));
+        }
+        Ok(None)
+    }
+
+    fn clear_fault_status(&mut self, status: u32) {
+        let bits =
+            status & (FSTS_PFO | FSTS_AFO | FSTS_APF | FSTS_IQE | FSTS_ICE | FSTS_ITE | FSTS_PRO);
+        if bits != 0 {
+            let _ = self.registers.write32(REG_FSTS, bits);
+        }
+    }
+
+    fn poll_primary_fault(&mut self, status: u32) -> Result<Option<VtdFault>> {
+        let index = ((status >> FSTS_FRI_SHIFT) & FSTS_FRI_MASK) as u16;
+        if index >= self.info.cap().fault_record_count() {
+            return Err(Error::ControllerUnavailable);
+        }
+
+        let fro = self.info.cap().fault_record_register_offset() as usize;
+        let record = fro
+            .checked_add(usize::from(index) * FRCD_ENTRY_STRIDE)
+            .ok_or(Error::AddressOverflow)?;
+        let low = self.registers.read64(
+            record
+                .checked_add(FRCD_LOW_OFFSET)
+                .ok_or(Error::AddressOverflow)?,
+        )?;
+        let high = self.registers.read64(
+            record
+                .checked_add(FRCD_HIGH_OFFSET)
+                .ok_or(Error::AddressOverflow)?,
+        )?;
+
+        if (high & FRCDH_FAULT) == 0 {
+            return Err(Error::ControllerUnavailable);
+        }
+
+        let fault = decode_primary_fault(self.info.base().segment().unwrap_or(0), index, low, high);
+        self.registers.write64(record + FRCD_HIGH_OFFSET, high)?;
+        Ok(Some(fault))
+    }
+}
+
+/// Queue-backed VT-d IOTLB invalidator.
+#[derive(Clone, Copy, Debug)]
+pub struct VtdQueuedInvalidator<Entry, const QN: usize>
+where
+    Entry: PageTableEntry,
+{
+    unit: *const VtdUnit<Entry, QN>,
+    domain: VtdIoDomain,
+    _unit: PhantomData<fn() -> VtdUnit<Entry, QN>>,
+}
+
+unsafe impl<Entry, const QN: usize> Send for VtdQueuedInvalidator<Entry, QN> where
+    Entry: PageTableEntry
+{
+}
+
+unsafe impl<Entry, const QN: usize> Sync for VtdQueuedInvalidator<Entry, QN> where
+    Entry: PageTableEntry
+{
+}
+
+impl<Entry, const QN: usize> VtdQueuedInvalidator<Entry, QN>
+where
+    Entry: PageTableEntry,
+{
+    #[inline]
+    pub const fn new(unit: *const VtdUnit<Entry, QN>, domain: VtdIoDomain) -> Self {
+        Self {
+            unit,
+            domain,
+            _unit: PhantomData,
+        }
+    }
+
+    #[inline]
+    pub const fn domain(self) -> VtdIoDomain {
+        self.domain
+    }
+
+    #[inline]
+    fn unit(&self) -> &VtdUnit<Entry, QN> {
+        unsafe { &*self.unit }
+    }
+
+    #[inline]
+    pub fn invalidate_domain(&self) -> Result {
+        self.unit().invalidate_iotlb_domain(self.domain)
+    }
+
+    #[inline]
+    pub fn invalidate_page(
+        &self,
+        iova: IoviAddr<u64>,
+        granule: PageSize,
+    ) -> Result<InvalidateScope> {
+        self.unit()
+            .invalidate_iotlb_page(self.domain, iova, granule)
+    }
+
+    #[inline]
+    pub fn invalidate_range(
+        &self,
+        start: IoviAddr<u64>,
+        page_size: PageSize,
+        count_pages: usize,
+    ) -> Result<InvalidateScope> {
+        self.unit()
+            .invalidate_iotlb_range(self.domain, start, page_size, count_pages)
+    }
+}
+
+impl<Entry, const QN: usize> TlbInvalidation<IoviAddr<u64>> for VtdQueuedInvalidator<Entry, QN>
+where
+    Entry: PageTableEntry,
+{
+    #[inline]
+    fn flush_tlb_local(&self, vaddr: IoviAddr<u64>) {
+        let _ = self.invalidate_page(vaddr, PageSize::Size4K);
+    }
+
+    #[inline]
+    fn flush_tlb_all_local(&self) {
+        let _ = self.invalidate_domain();
+    }
+
+    #[inline]
+    fn flush_tlb_range_local(&self, start: IoviAddr<u64>, page_size: PageSize, count_pages: usize) {
+        let _ = self.invalidate_range(start, page_size, count_pages);
+    }
+
+    #[inline]
+    fn prefer_full_flush(&self, pending_count: usize) -> bool {
+        pending_count > 32
+    }
+}
+
+impl<Entry, const QN: usize> IoTlbInvalidation<IoviAddr<u64>> for VtdQueuedInvalidator<Entry, QN>
+where
+    Entry: PageTableEntry,
+{
+    type Client = PciDevice;
+
+    #[inline]
+    fn flush_iotlb(&self, iova: IoviAddr<u64>) {
+        let _ = self.invalidate_page(iova, PageSize::Size4K);
+    }
+
+    #[inline]
+    fn flush_iotlb_all(&self) {
+        let _ = self.invalidate_domain();
+    }
+
+    #[inline]
+    fn flush_iotlb_range(&self, start: IoviAddr<u64>, page_size: PageSize, count_pages: usize) {
+        let _ = self.invalidate_range(start, page_size, count_pages);
+    }
+
+    #[inline]
+    fn flush_device_tlb(&self, _client: PciDevice, _iova: IoviAddr<u64>) {}
+
+    #[inline]
+    fn flush_device_tlb_all(&self, _client: PciDevice) {}
+
+    #[inline]
+    fn prefer_full_iotlb_flush(&self, pending_count: usize) -> bool {
+        pending_count > 32
+    }
+}
+
+/// Per-domain VT-d controller facade.
+pub struct VtdDomainController<'unit, Pt, Entry, const QN: usize>
+where
+    Entry: PageTableEntry,
+{
+    domain: VtdDomain,
+    page_table: Pt,
+    unit: &'unit mut VtdUnit<Entry, QN>,
+    invalidator: VtdQueuedInvalidator<Entry, QN>,
+}
+
+impl<'unit, Pt, Entry, const QN: usize> VtdDomainController<'unit, Pt, Entry, QN>
+where
+    Entry: PageTableEntry,
+{
+    #[inline]
+    pub fn new(domain: VtdDomain, page_table: Pt, unit: &'unit mut VtdUnit<Entry, QN>) -> Self {
+        let unit_ptr = unit as *const VtdUnit<Entry, QN>;
+        Self {
+            domain,
+            page_table,
+            unit,
+            invalidator: VtdQueuedInvalidator::new(unit_ptr, domain.id()),
+        }
+    }
+
+    #[inline]
+    pub const fn page_table(&self) -> &Pt {
+        &self.page_table
+    }
+
+    #[inline]
+    pub const fn page_table_mut(&mut self) -> &mut Pt {
+        &mut self.page_table
+    }
+
+    #[inline]
+    pub const fn unit(&self) -> &VtdUnit<Entry, QN> {
+        self.unit
+    }
+
+    #[inline]
+    pub const fn unit_mut(&mut self) -> &mut VtdUnit<Entry, QN> {
+        self.unit
+    }
+}
+
+impl<'unit, Pt, Entry, const QN: usize> PageTable<IoviAddr<u64>>
+    for VtdDomainController<'unit, Pt, Entry, QN>
+where
+    Pt: PageTable<IoviAddr<u64>, Entry = VtdSecondLevelPte>,
+    Entry: PageTableEntry,
+{
+    const INPUT_ADDR_BITS: u8 = Pt::INPUT_ADDR_BITS;
+    const OUTPUT_ADDR_BITS: u8 = Pt::OUTPUT_ADDR_BITS;
+
+    type Entry = VtdSecondLevelPte;
+
+    #[inline]
+    fn root(&self) -> PhysAddr {
+        self.page_table.root()
+    }
+
+    #[inline]
+    fn query(&self, vaddr: IoviAddr<u64>) -> PagingResult<Mapping<Self::Entry, IoviAddr<u64>>> {
+        self.page_table.query(vaddr)
+    }
+
+    #[inline]
+    fn map<'a, B, F, Tlb>(
+        &mut self,
+        range: AddrRange<IoviAddr<u64>>,
+        backing: B,
+        flags: F,
+        tlb: &Tlb,
+    ) -> PagingResult
+    where
+        B: IntoMapBacking<'a>,
+        F: Into<MappingFlags<<Self::Entry as PageTableEntry>::Flags>>,
+        Tlb: TlbInvalidation<IoviAddr<u64>>,
+    {
+        self.page_table.map(range, backing, flags, tlb)
+    }
+
+    #[inline]
+    fn remap<Tlb>(
+        &mut self,
+        range: AddrRange<IoviAddr<u64>>,
+        paddr: PhysAddr,
+        flags: <Self::Entry as PageTableEntry>::Flags,
+        tlb: &Tlb,
+    ) -> PagingResult<Mapping<Self::Entry, IoviAddr<u64>>>
+    where
+        Tlb: TlbInvalidation<IoviAddr<u64>>,
+    {
+        self.page_table.remap(range, paddr, flags, tlb)
+    }
+
+    #[inline]
+    fn protect<Tlb>(
+        &mut self,
+        range: AddrRange<IoviAddr<u64>>,
+        flags: <Self::Entry as PageTableEntry>::Flags,
+        tlb: &Tlb,
+    ) -> PagingResult<Mapping<Self::Entry, IoviAddr<u64>>>
+    where
+        Tlb: TlbInvalidation<IoviAddr<u64>>,
+    {
+        self.page_table.protect(range, flags, tlb)
+    }
+
+    #[inline]
+    fn unmap<Tlb>(
+        &mut self,
+        range: AddrRange<IoviAddr<u64>>,
+        tlb: &Tlb,
+    ) -> PagingResult<Mapping<Self::Entry, IoviAddr<u64>>>
+    where
+        Tlb: TlbInvalidation<IoviAddr<u64>>,
+    {
+        self.page_table.unmap(range, tlb)
+    }
+
+    #[inline]
+    fn split_at<Tlb>(
+        &mut self,
+        range: AddrRange<IoviAddr<u64>>,
+        tlb: &Tlb,
+    ) -> PagingResult<PageSize>
+    where
+        Tlb: TlbInvalidation<IoviAddr<u64>>,
+    {
+        self.page_table.split_at(range, tlb)
+    }
+
+    #[inline]
+    fn merge_at<Tlb>(
+        &mut self,
+        range: AddrRange<IoviAddr<u64>>,
+        tlb: &Tlb,
+    ) -> PagingResult<PageSize>
+    where
+        Tlb: TlbInvalidation<IoviAddr<u64>>,
+    {
+        self.page_table.merge_at(range, tlb)
+    }
+}
+
+impl<'unit, Pt, Entry, const QN: usize> Controller<IoviAddr<u64>>
+    for VtdDomainController<'unit, Pt, Entry, QN>
+where
+    Pt: PageTable<IoviAddr<u64>, Entry = VtdSecondLevelPte>,
+    Entry: PageTableEntry,
+{
+    type Info = VtdInfo;
+    type Client = PciDevice;
+    type Domain = VtdDomain;
+    type Invalidator = VtdQueuedInvalidator<Entry, QN>;
+    type Fault = VtdFault;
+
+    #[inline]
+    fn info(&self) -> &Self::Info {
+        self.unit.info()
+    }
+
+    #[inline]
+    fn domain(&self) -> Self::Domain {
+        self.domain
+    }
+
+    #[inline]
+    fn stage(&self) -> crate::TranslationStage {
+        self.domain.stage()
+    }
+
+    #[inline]
+    fn enable(&mut self) -> Result {
+        self.unit.enable_translation()
+    }
+
+    #[inline]
+    fn bind(&mut self, binding: Binding<Self::Client, Self::Domain>) -> Result {
+        self.unit.bind_context(self.domain, binding)
+    }
+
+    #[inline]
+    fn unbind(&mut self, client: Self::Client, selector: BindingSelector) -> Result {
+        self.unit.unbind_context(self.domain, client, selector)
+    }
+
+    #[inline]
+    fn invalidator(&self) -> &Self::Invalidator {
+        &self.invalidator
+    }
+
+    fn invalidate(
+        &mut self,
+        request: Invalidate<Self::Client, IoviAddr<u64>>,
+    ) -> Result<InvalidateOutcome> {
+        let scope = match request {
+            Invalidate::Global => {
+                self.unit.invalidate_iotlb_global()?;
+                InvalidateScope::Global
+            }
+            Invalidate::AddressSpace => {
+                self.unit.invalidate_iotlb_domain(self.domain.id())?;
+                InvalidateScope::Domain
+            }
+            Invalidate::Leaf { iova, granule } => {
+                self.unit
+                    .invalidate_iotlb_page(self.domain.id(), iova, granule)?
+            }
+            Invalidate::Device { .. } | Invalidate::DeviceLeaf { .. } => {
+                return Err(Error::FeatureUnavailable);
+            }
+        };
+        Ok(InvalidateOutcome::new(scope, true))
+    }
+
+    #[inline]
+    fn configure_fault_event(&mut self, route: InterruptRoute) -> Result {
+        self.unit.registers.configure_fault_event(route)
+    }
+
+    #[inline]
+    fn poll_fault(&mut self) -> Result<Option<Self::Fault>> {
+        self.unit.poll_fault()
+    }
+}
+
 /// Raw queued-invalidation descriptor, ready to be written to a VT-d QI ring.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 #[repr(C)]
@@ -1223,6 +2059,23 @@ impl VtdQueuedInvalidationDescriptor {
             .page_selective_address_mask(granule)
             .ok_or(VtdError::PageSelectiveInvalidationUnavailable)?;
 
+        Self::iotlb_page_with_address_mask(domain, iova, address_mask, cap)
+    }
+
+    #[inline]
+    pub fn iotlb_page_with_address_mask(
+        domain: VtdIoDomain,
+        iova: IoviAddr<u64>,
+        address_mask: u8,
+        cap: VtdCapability,
+    ) -> Result<Self> {
+        if !cap.page_selective_invalidation()
+            || address_mask > cap.max_address_mask_value()
+            || address_mask > IVA_AM_MASK as u8
+        {
+            return Err(VtdError::PageSelectiveInvalidationUnavailable.into());
+        }
+
         Ok(Self::from_words(
             QI_IOTLB_TYPE
                 | QI_IOTLB_PAGE
@@ -1283,6 +2136,27 @@ const fn remapped_msi_message(entry: VtdInterruptEntry, subhandle: u16) -> MsiMe
 }
 
 #[inline]
+fn queued_invalidation_table_address(backing: CommandQueueBacking) -> Result<u64> {
+    if backing.entry_bytes() != QI_ENTRY_BYTES {
+        return Err(Error::InvalidGranule);
+    }
+    if backing.entry_count() < QI_MIN_ENTRIES || !backing.entry_count().is_power_of_two() {
+        return Err(Error::InvalidRange);
+    }
+    if !backing.phys().start.is_aligned(PageSize::Size4K.bytes()) {
+        return Err(Error::InvalidAddress);
+    }
+
+    let size = backing.entry_count() / QI_MIN_ENTRIES;
+    let encoded = size.trailing_zeros() as u64;
+    if encoded > IQA_SIZE_MASK {
+        return Err(Error::InvalidRange);
+    }
+
+    Ok(((backing.phys().start.as_usize() as u64) & PAGE_ADDR_MASK) | encoded)
+}
+
+#[inline]
 const fn vtd_agaw_bits(width: super::paging::VtdSecondLevelAddressWidth) -> u64 {
     match width {
         super::paging::VtdSecondLevelAddressWidth::Bits39 => 1,
@@ -1294,6 +2168,175 @@ const fn vtd_agaw_bits(width: super::paging::VtdSecondLevelAddressWidth) -> u64 
 #[inline]
 const fn vtd_context_entry_index(client: PciDevice) -> u8 {
     (client.device() << 3) | client.function()
+}
+
+#[inline]
+fn decode_fault_status(status: u32) -> Option<VtdFault> {
+    let reason = if (status & FSTS_PFO) != 0 {
+        VtdFaultReason::PrimaryFaultOverflow
+    } else if (status & FSTS_AFO) != 0 {
+        VtdFaultReason::AdvancedFaultOverflow
+    } else if (status & FSTS_APF) != 0 {
+        VtdFaultReason::AdvancedPendingFault
+    } else if (status & FSTS_IQE) != 0 {
+        VtdFaultReason::InvalidationQueueError
+    } else if (status & FSTS_ICE) != 0 {
+        VtdFaultReason::InvalidationCompletionError
+    } else if (status & FSTS_ITE) != 0 {
+        VtdFaultReason::InvalidationTimeout
+    } else if (status & FSTS_PRO) != 0 {
+        VtdFaultReason::PageRequestOverflow
+    } else {
+        return None;
+    };
+
+    Some(VtdFault::new(
+        reason,
+        None,
+        None,
+        None,
+        DmaAccess::empty(),
+        None,
+        matches!(
+            reason,
+            VtdFaultReason::PrimaryFaultOverflow | VtdFaultReason::AdvancedFaultOverflow
+        ),
+        (status & FSTS_PPF) != 0,
+    ))
+}
+
+#[inline]
+fn decode_primary_fault(segment: u16, index: u16, low: u64, high: u64) -> VtdFault {
+    let raw_reason = ((high >> FRCDH_REASON_SHIFT) & FRCDH_REASON_MASK) as u8;
+    let source_id = (high & FRCDH_SOURCE_ID_MASK) as u16;
+    let client = PciDevice::from_segment_bdf(segment, Bdf::from_u16(source_id));
+    let iova = IoviAddr::<u64>::from((low & FRCDL_FAULT_INFO_MASK) as usize);
+    let mut access = DmaAccess::empty();
+
+    if (high & (FRCDH_TYPE_1 | FRCDH_TYPE_2)) != 0 {
+        access |= DmaAccess::READ;
+    }
+    if (high & FRCDH_EXECUTE) != 0 {
+        access |= DmaAccess::READ | DmaAccess::EXECUTE;
+    }
+    if access.is_empty() {
+        access |= DmaAccess::WRITE;
+    }
+    if (high & FRCDH_PRIVILEGE) == 0 {
+        access |= DmaAccess::USER;
+    }
+
+    VtdFault::new(
+        VtdFaultReason::Primary { raw: raw_reason },
+        Some(source_id),
+        Some(client),
+        Some(iova),
+        access,
+        Some(index),
+        false,
+        true,
+    )
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct VtdIotlbRangeBlock {
+    page: usize,
+    address_mask: u8,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct VtdIotlbRangePlan {
+    next_page: usize,
+    remaining_pages: usize,
+    min_mask: u8,
+    max_mask: u8,
+}
+
+impl VtdIotlbRangePlan {
+    #[inline]
+    fn new(start_page: usize, page_count: usize, min_mask: u8, max_mask: u8) -> Result<Self> {
+        if page_count == 0 {
+            return Ok(Self {
+                next_page: start_page,
+                remaining_pages: 0,
+                min_mask,
+                max_mask,
+            });
+        }
+        if max_mask < min_mask {
+            return Err(Error::FeatureUnavailable);
+        }
+        let min_pages = 1usize
+            .checked_shl(u32::from(min_mask))
+            .ok_or(Error::AddressOverflow)?;
+        if (start_page & (min_pages - 1)) != 0 || (page_count & (min_pages - 1)) != 0 {
+            return Err(Error::InvalidRange);
+        }
+
+        Ok(Self {
+            next_page: start_page,
+            remaining_pages: page_count,
+            min_mask,
+            max_mask,
+        })
+    }
+
+    #[inline]
+    fn descriptor_count(self) -> usize {
+        let mut cursor = self;
+        let mut count = 0usize;
+        while cursor.next_block().is_some() {
+            count = count.saturating_add(1);
+        }
+        count
+    }
+
+    #[inline]
+    fn next_block(&mut self) -> Option<VtdIotlbRangeBlock> {
+        if self.remaining_pages == 0 {
+            return None;
+        }
+
+        let mask = self.next_address_mask();
+        let pages = 1usize << mask;
+        let block = VtdIotlbRangeBlock {
+            page: self.next_page,
+            address_mask: mask,
+        };
+        self.next_page = self.next_page.saturating_add(pages);
+        self.remaining_pages -= pages;
+        Some(block)
+    }
+
+    #[inline]
+    fn next_address_mask(self) -> u8 {
+        let remaining_mask = floor_log2_usize(self.remaining_pages);
+        let alignment_mask = if self.next_page == 0 {
+            (usize::BITS - 1) as u8
+        } else {
+            self.next_page.trailing_zeros().min(usize::BITS - 1) as u8
+        };
+
+        remaining_mask
+            .min(alignment_mask)
+            .min(self.max_mask)
+            .max(self.min_mask)
+    }
+}
+
+#[inline]
+const fn floor_log2_usize(value: usize) -> u8 {
+    (usize::BITS - 1 - value.leading_zeros()) as u8
+}
+
+#[inline]
+const fn vtd_iotlb_granule_address_mask(size: PageSize) -> Option<u8> {
+    match size {
+        PageSize::Size4K => Some(0),
+        PageSize::Size2M => Some(9),
+        PageSize::Size1G => Some(18),
+        _ => None,
+    }
 }
 
 #[inline]
@@ -1382,6 +2425,11 @@ mod tests {
     const CAP_MAMV_SHIFT: u64 = 48;
     const ECAP_PT: u64 = 1 << 6;
 
+    fn mmio_range(base: usize, size: usize) -> MmioAddrRange {
+        <MmioAddrRange as MmioRange<usize>>::from_start_size(crate::MmioAddr::from(base), size)
+            .unwrap()
+    }
+
     fn table_range(buffer: &mut [u8], phys_base: usize) -> (PhysAddrRange, VirtAddrRange) {
         (
             PhysAddrRange::from_start_size(PhysAddr::from_usize(phys_base), buffer.len()),
@@ -1390,6 +2438,45 @@ mod tests {
                 buffer.len(),
             ),
         )
+    }
+
+    fn queue_backing(buffer: &mut [u8], phys_base: usize, entries: usize) -> CommandQueueBacking {
+        let (phys, virt) = table_range(buffer, phys_base);
+        unsafe { CommandQueueBacking::new(phys, virt, entries, QI_ENTRY_BYTES) }.unwrap()
+    }
+
+    fn register_window(buffer: &mut [u8]) -> VtdRegisterWindow<VtdSecondLevelPte> {
+        let range = VirtAddrRange::from_start_size(
+            VirtAddr::from_usize(buffer.as_mut_ptr() as usize),
+            buffer.len(),
+        );
+        VtdRegisterWindow::new(Mapping::new(
+            range,
+            PhysAddr::from_usize(0xfee0_0000),
+            super::super::paging::VtdSecondLevelFlags::default(),
+        ))
+    }
+
+    fn unit_info(segment: Option<u16>, cap: u64, ecap: u64) -> VtdInfo {
+        VtdInfo::from_registers(
+            segment,
+            mmio_range(0xfee0_0000, PageSize::Size4K.bytes()),
+            0x10,
+            Some(48),
+            cap,
+            ecap,
+            true,
+        )
+    }
+
+    fn root_table(buffer: &mut [u8]) -> VtdRootTableBacking {
+        let (phys, virt) = table_range(buffer, 0x4000);
+        unsafe { VtdRootTableBacking::new(phys, virt) }.unwrap()
+    }
+
+    fn context_table(buffer: &mut [u8]) -> VtdContextTableBacking {
+        let (phys, virt) = table_range(buffer, 0x8000);
+        unsafe { VtdContextTableBacking::new(phys, virt) }.unwrap()
     }
 
     #[test]
@@ -1443,6 +2530,282 @@ mod tests {
 
         assert_eq!(VtdContextTableBacking::client_entry_index(client), 0x2b);
         assert_eq!(read_context_entry(context_table, client).unwrap(), entry);
+    }
+
+    #[test]
+    fn queued_invalidation_table_address_encodes_queue_size() {
+        for (entries, encoded) in [(256, 0), (512, 1), (1024, 2)] {
+            let mut buffer = vec![0u8; entries * QI_ENTRY_BYTES];
+            let backing = queue_backing(&mut buffer, 0x20_0000, entries);
+
+            assert_eq!(
+                queued_invalidation_table_address(backing).unwrap(),
+                0x20_0000 | encoded
+            );
+        }
+    }
+
+    #[test]
+    fn queued_invalidation_table_address_rejects_invalid_backing() {
+        let mut small = vec![0u8; 128 * QI_ENTRY_BYTES];
+        let small = unsafe {
+            CommandQueueBacking::new(
+                table_range(&mut small, 0x20_0000).0,
+                table_range(&mut small, 0x20_0000).1,
+                128,
+                QI_ENTRY_BYTES,
+            )
+        }
+        .unwrap();
+        assert_eq!(
+            queued_invalidation_table_address(small),
+            Err(Error::InvalidRange)
+        );
+
+        let mut wide = vec![0u8; 256 * 32];
+        let (phys, virt) = table_range(&mut wide, 0x20_0000);
+        let wide = unsafe { CommandQueueBacking::new(phys, virt, 256, 32) }.unwrap();
+        assert_eq!(
+            queued_invalidation_table_address(wide),
+            Err(Error::InvalidGranule)
+        );
+
+        let mut unaligned = vec![0u8; 256 * QI_ENTRY_BYTES];
+        let backing = queue_backing(&mut unaligned, 0x20_0080, 256);
+        assert_eq!(
+            queued_invalidation_table_address(backing),
+            Err(Error::InvalidAddress)
+        );
+    }
+
+    #[test]
+    fn unit_installs_context_table_for_bus() {
+        let mut regs = vec![0u8; PageSize::Size4K.bytes()];
+        let mut root_page = vec![0u8; PageSize::Size4K.bytes()];
+        let mut context_page = vec![0u8; PageSize::Size4K.bytes()];
+        let root = root_table(&mut root_page);
+        let context = context_table(&mut context_page);
+        let mut unit: VtdUnit<VtdSecondLevelPte, 256> =
+            VtdUnit::new(unit_info(Some(0), 0, 0), register_window(&mut regs), root);
+
+        unit.install_context_table(7, context).unwrap();
+
+        assert_eq!(unit.context_table(7), Some(context));
+        assert_eq!(
+            read_root_entry(root, 7).unwrap().context_table_root(),
+            Some(context.phys().start)
+        );
+    }
+
+    #[test]
+    fn bind_validation_rejects_unsupported_or_wrong_contexts() {
+        let mut regs = vec![0u8; PageSize::Size4K.bytes()];
+        let mut root_page = vec![0u8; PageSize::Size4K.bytes()];
+        let root = root_table(&mut root_page);
+        let mut unit: VtdUnit<VtdSecondLevelPte, 256> =
+            VtdUnit::new(unit_info(Some(3), 0, 0), register_window(&mut regs), root);
+        let active = VtdDomain::new(
+            VtdIoDomain::from_asid(1).unwrap(),
+            PhysAddr::from_usize(0x20_0000),
+            super::super::paging::VtdSecondLevelAddressWidth::Bits48,
+            crate::TranslationStage::Stage2,
+        );
+        let other = VtdDomain::new(
+            VtdIoDomain::from_asid(2).unwrap(),
+            PhysAddr::from_usize(0x30_0000),
+            super::super::paging::VtdSecondLevelAddressWidth::Bits48,
+            crate::TranslationStage::Stage2,
+        );
+        let client = PciDevice::new(3, 4, 1, 0).unwrap();
+
+        assert_eq!(
+            unit.bind_context(
+                active,
+                Binding::new(
+                    client,
+                    BindingSelector::from_substream(1),
+                    BindingTarget::Domain(active),
+                ),
+            ),
+            Err(Error::FeatureUnavailable)
+        );
+        assert_eq!(
+            unit.bind_context(
+                active,
+                Binding::new(
+                    PciDevice::new(4, 4, 1, 0).unwrap(),
+                    BindingSelector::Default,
+                    BindingTarget::Domain(active),
+                ),
+            ),
+            Err(Error::InvalidClient)
+        );
+        assert_eq!(
+            unit.bind_context(
+                active,
+                Binding::new(
+                    client,
+                    BindingSelector::Default,
+                    BindingTarget::Domain(other)
+                ),
+            ),
+            Err(Error::InvalidAddressSpace)
+        );
+        assert_eq!(
+            unit.bind_context(
+                active,
+                Binding::new(
+                    client,
+                    BindingSelector::Default,
+                    BindingTarget::Domain(active)
+                ),
+            ),
+            Err(Error::ControllerUnavailable)
+        );
+    }
+
+    #[test]
+    fn page_invalidation_falls_back_to_domain_without_psi() {
+        let mut regs = vec![0u8; PageSize::Size4K.bytes()];
+        let mut root_page = vec![0u8; PageSize::Size4K.bytes()];
+        let mut queue = vec![0u8; 256 * QI_ENTRY_BYTES];
+        let root = root_table(&mut root_page);
+        let mut registers = register_window(&mut regs);
+        registers.write64(REG_IQH, QI_ENTRY_BYTES as u64).unwrap();
+        let mut unit: VtdUnit<VtdSecondLevelPte, 256> =
+            VtdUnit::new(unit_info(Some(0), 0, 0), registers, root);
+        unit.queue
+            .init(queue_backing(&mut queue, 0x20_0000, 256))
+            .unwrap();
+
+        assert_eq!(
+            unit.invalidate_iotlb_page(
+                VtdIoDomain::from_asid(7).unwrap(),
+                IoviAddr::<u64>::from(0x4000),
+                PageSize::Size1G,
+            )
+            .unwrap(),
+            InvalidateScope::Domain
+        );
+
+        let low = u64::from_ne_bytes(queue[0..8].try_into().unwrap());
+        assert_eq!(low & QI_IOTLB_DOMAIN, QI_IOTLB_DOMAIN);
+        assert_eq!((low >> QI_IOTLB_DID_SHIFT) & 0xffff, 7);
+    }
+
+    #[test]
+    fn range_invalidation_coalesces_to_largest_supported_address_mask() {
+        let mut regs = vec![0u8; PageSize::Size4K.bytes()];
+        let mut root_page = vec![0u8; PageSize::Size4K.bytes()];
+        let mut queue = vec![0u8; 256 * QI_ENTRY_BYTES];
+        let root = root_table(&mut root_page);
+        let mut registers = register_window(&mut regs);
+        registers.write64(REG_IQH, QI_ENTRY_BYTES as u64).unwrap();
+        let cap = CAP_PSI | (18_u64 << CAP_MAMV_SHIFT);
+        let mut unit: VtdUnit<VtdSecondLevelPte, 256> =
+            VtdUnit::new(unit_info(Some(0), cap, 0), registers, root);
+        unit.queue
+            .init(queue_backing(&mut queue, 0x20_0000, 256))
+            .unwrap();
+
+        assert_eq!(
+            unit.invalidate_iotlb_range(
+                VtdIoDomain::from_asid(7).unwrap(),
+                IoviAddr::<u64>::from(0x20_0000),
+                PageSize::Size4K,
+                512,
+            )
+            .unwrap(),
+            InvalidateScope::Leaf
+        );
+
+        let low = u64::from_ne_bytes(queue[0..8].try_into().unwrap());
+        let high = u64::from_ne_bytes(queue[8..16].try_into().unwrap());
+        assert_eq!(low & QI_IOTLB_PAGE, QI_IOTLB_PAGE);
+        assert_eq!(high & PAGE_ADDR_MASK, 0x20_0000);
+        assert_eq!(high & IVA_AM_MASK, 9);
+        assert_eq!(
+            unit.registers.invalidate_queue_tail().unwrap(),
+            QI_ENTRY_BYTES
+        );
+    }
+
+    #[test]
+    fn range_invalidation_uses_domain_when_descriptor_count_is_too_high() {
+        let mut regs = vec![0u8; PageSize::Size4K.bytes()];
+        let mut root_page = vec![0u8; PageSize::Size4K.bytes()];
+        let mut queue = vec![0u8; 256 * QI_ENTRY_BYTES];
+        let root = root_table(&mut root_page);
+        let mut registers = register_window(&mut regs);
+        registers.write64(REG_IQH, QI_ENTRY_BYTES as u64).unwrap();
+        let cap = CAP_PSI;
+        let mut unit: VtdUnit<VtdSecondLevelPte, 256> =
+            VtdUnit::new(unit_info(Some(0), cap, 0), registers, root);
+        unit.queue
+            .init(queue_backing(&mut queue, 0x20_0000, 256))
+            .unwrap();
+
+        assert_eq!(
+            unit.invalidate_iotlb_range(
+                VtdIoDomain::from_asid(7).unwrap(),
+                IoviAddr::<u64>::from(0x4000),
+                PageSize::Size4K,
+                IOTLB_RANGE_DOMAIN_INVALIDATION_THRESHOLD + 1,
+            )
+            .unwrap(),
+            InvalidateScope::Domain
+        );
+
+        let low = u64::from_ne_bytes(queue[0..8].try_into().unwrap());
+        assert_eq!(low & QI_IOTLB_DOMAIN, QI_IOTLB_DOMAIN);
+        assert_eq!((low >> QI_IOTLB_DID_SHIFT) & 0xffff, 7);
+    }
+
+    #[test]
+    fn range_plan_splits_by_alignment_and_capability() {
+        let mut plan = VtdIotlbRangePlan::new(512, 1024, 0, 18).unwrap();
+
+        assert_eq!(
+            plan.next_block(),
+            Some(VtdIotlbRangeBlock {
+                page: 512,
+                address_mask: 9,
+            })
+        );
+        assert_eq!(
+            plan.next_block(),
+            Some(VtdIotlbRangeBlock {
+                page: 1024,
+                address_mask: 9,
+            })
+        );
+        assert_eq!(plan.next_block(), None);
+    }
+
+    #[test]
+    fn fault_decoders_preserve_primary_record_details() {
+        let fault = decode_primary_fault(
+            2,
+            3,
+            0x1234_5678,
+            FRCDH_FAULT | FRCDH_EXECUTE | (0x2a << FRCDH_REASON_SHIFT) | 0x0408,
+        );
+
+        assert_eq!(fault.reason(), VtdFaultReason::Primary { raw: 0x2a });
+        assert_eq!(fault.record_index(), Some(3));
+        assert_eq!(fault.source_id(), Some(0x0408));
+        assert_eq!(
+            fault.client(),
+            Some(PciDevice::from_segment_bdf(2, Bdf::from_u16(0x0408)))
+        );
+        assert_eq!(fault.iova(), Some(IoviAddr::<u64>::from(0x1234_5000)));
+        assert!(fault.access().contains(DmaAccess::READ));
+        assert!(fault.access().contains(DmaAccess::EXECUTE));
+
+        let status_fault = decode_fault_status(FSTS_AFO | FSTS_PPF).unwrap();
+        assert_eq!(status_fault.reason(), VtdFaultReason::AdvancedFaultOverflow);
+        assert!(status_fault.overflow());
+        assert!(status_fault.pending());
     }
 
     #[test]

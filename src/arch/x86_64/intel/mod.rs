@@ -7,10 +7,11 @@ pub mod paging;
 
 pub use caps::{VTD_MMIO_SIZE, VtdCapability, VtdExtendedCapability};
 pub use ctrl::{
-    VtdContextEntry, VtdContextTableBacking, VtdInterruptEntry, VtdInterruptRemapEntry,
-    VtdInterruptRemapTableBacking, VtdInterruptRemapTarget, VtdQueuedInvalidationDescriptor,
-    VtdQueuedInvalidationQueue, VtdRegisterWindow, VtdRemappedMsi, VtdRootEntry,
-    VtdRootTableBacking,
+    VtdContextEntry, VtdContextTableBacking, VtdDomainController, VtdFault, VtdFaultReason,
+    VtdInterruptEntry, VtdInterruptRemapEntry, VtdInterruptRemapTableBacking,
+    VtdInterruptRemapTarget, VtdQueuedInvalidationDescriptor, VtdQueuedInvalidationQueue,
+    VtdQueuedInvalidator, VtdRegisterWindow, VtdRemappedMsi, VtdRootEntry, VtdRootTableBacking,
+    VtdUnit,
 };
 pub use error::VtdError;
 pub use info::{
